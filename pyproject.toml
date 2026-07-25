@@ -12,65 +12,8 @@ license = "MIT"
 authors = [{name = "greyxp1"}]
 dependencies = ["av>=16,<18"]
 
-[project.optional-dependencies]
-test = [
-    "numpy",
-    "ffmpeg-python",
-    "soundfile",
-    "scipy",
-    "requests",
-    "psutil",
-]
-
 [project.scripts]
 mpv-smartcut-backend = "smartcut.__main__:main"
 
 [tool.setuptools]
 packages = ["smartcut"]
-
-[tool.ruff]
-line-length = 300
-
-[tool.ruff.lint]
-# Select specific rules to check
-select = [
-    "E",      # pycodestyle errors
-    "W",      # pycodestyle warnings
-    "F",      # pyflakes
-    "UP",     # pyupgrade
-    "B",      # flake8-bugbear
-    "SIM",    # flake8-simplify
-    "I",      # isort
-    "PLC",    # pylint conventions
-    "PLE",    # pylint errors
-    "PLR",    # pylint refactor
-    "PLW",    # pylint warnings
-    "RUF",    # ruff-specific rules
-    "ANN",    # type annotations
-]
-
-# Ignore specific rules that are not relevant for this project
-ignore = [
-    "PLR2004",  # Magic value used in comparison
-    "PLR0912",  # Too many branches
-    "PLR0915",  # Too many statements
-    "PLR0913",  # Too many arguments
-    "PLR0911",  # Too many return statements
-    "B905",     # zip without strict= parameter
-    "PLW2901",  # for loop variable overwritten
-]
-
-[tool.ruff.format]
-# Use double quotes for strings
-quote-style = "double"
-# Use spaces for indentation
-indent-style = "space"
-
-[tool.pyright]
-include = ["smartcut", "tests"]
-venvPath = "."
-venv = "venv"
-reportUnusedVariable = "warning"
-reportUnusedFunction = "warning"
-reportUnusedClass = "warning"
-reportUnusedImport = "warning"

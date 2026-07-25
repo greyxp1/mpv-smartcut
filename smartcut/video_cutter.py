@@ -15,7 +15,7 @@ from av.stream import Disposition
 from av.video.frame import PictureType, VideoFrame
 
 from smartcut.media_container import MediaContainer
-from smartcut.media_utils import VideoExportMode, VideoExportQuality, get_crf_for_quality
+from smartcut.media_utils import VideoExportQuality, get_crf_for_quality
 from smartcut.misc_data import CutSegment
 from smartcut.nal_tools import get_h265_nal_unit_type, is_leading_picture_nal_type
 
@@ -56,40 +56,27 @@ def copy_packet(p: Packet) -> Packet:
 
 
 @dataclass
-class VideoSettings:
-    mode: VideoExportMode
-    quality: VideoExportQuality
-    codec_override: str = 'copy'
-
-
-@dataclass
 class VideoStreamSetup:
-    """Result of creating a video output stream, used to initialize VideoCutter."""
     out_stream: VideoStream
     codec_name: str
-    is_full_recode: bool  # True if VideoExportMode.RECODE with codec override
 
 
 def create_video_output_stream(
     media_container: MediaContainer,
     output_av_container: OutputContainer,
-    video_settings: VideoSettings,
 ) -> VideoStreamSetup:
-    """
-    Create output video stream from source media container.
-
-    Separated from VideoCutter to allow reuse in joining operations where
-    multiple input files write to the same output stream.
-    """
     in_stream = cast(VideoStream, media_container.video_stream)
     assert in_stream.time_base is not None, "Video stream must have a time_base"
 
-    if video_settings.mode == VideoExportMode.RECODE and video_settings.codec_override != 'copy':
-        # Full recode mode with explicit codec
+    original_codec_name = in_stream.codec_context.name
+    codec_name = {
+        "libdav1d": "libaom-av1",
+    }.get(original_codec_name, original_codec_name)
+
+    if codec_name != original_codec_name:
         out_stream = cast(VideoStream, output_av_container.add_stream(
-            video_settings.codec_override,
+            codec_name,
             rate=in_stream.guessed_rate,
-            options={'x265-params': 'log_level=error'}
         ))
         out_stream.width = in_stream.width
         out_stream.height = in_stream.height
@@ -98,53 +85,17 @@ def create_video_output_stream(
         out_stream.metadata.update(in_stream.metadata)
         out_stream.disposition = cast(Disposition, in_stream.disposition.value)
         out_stream.time_base = in_stream.time_base
-        codec_name = video_settings.codec_override
-        is_full_recode = True
     else:
-        # Smartcut/copy mode - preserve codec from input
-        original_codec_name = in_stream.codec_context.name
-
-        codec_mapping = {
-            'libdav1d': 'libaom-av1',  # AV1 decoder to encoder
-        }
-        mapped_codec_name = codec_mapping.get(original_codec_name, original_codec_name)
-
-        if mapped_codec_name != original_codec_name:
-            # Need to create stream with mapped codec name
-            out_stream = cast(VideoStream, output_av_container.add_stream(
-                mapped_codec_name,
-                rate=in_stream.guessed_rate
-            ))
-            out_stream.width = in_stream.width
-            out_stream.height = in_stream.height
-            if in_stream.sample_aspect_ratio is not None:
-                out_stream.sample_aspect_ratio = in_stream.sample_aspect_ratio
-            out_stream.metadata.update(in_stream.metadata)
-            out_stream.disposition = cast(Disposition, in_stream.disposition.value)
-            out_stream.time_base = in_stream.time_base
-            codec_name = mapped_codec_name
-        else:
-            # Copy the stream if no mapping needed
-            out_stream = output_av_container.add_stream_from_template(
-                in_stream,
-                options={'x265-params': 'log_level=error'}
-            )
-            out_stream.metadata.update(in_stream.metadata)
-            out_stream.disposition = cast(Disposition, in_stream.disposition.value)
-            out_stream.time_base = in_stream.time_base
-            codec_name = original_codec_name
-
-        is_full_recode = False
-
-    # Note: Codec tag normalization is done in VideoCutter.__init__ after bitstream filter setup
+        out_stream = output_av_container.add_stream_from_template(
+            in_stream,
+            options={"x265-params": "log_level=error"},
+        )
+        out_stream.metadata.update(in_stream.metadata)
+        out_stream.disposition = cast(Disposition, in_stream.disposition.value)
+        out_stream.time_base = in_stream.time_base
 
     assert out_stream.time_base is not None, "Output stream must have a time_base"
-
-    return VideoStreamSetup(
-        out_stream=out_stream,
-        codec_name=codec_name,
-        is_full_recode=is_full_recode,
-    )
+    return VideoStreamSetup(out_stream, codec_name)
 
 
 def _normalize_output_codec_tag(
@@ -189,15 +140,11 @@ class VideoCutter:
         media_container: MediaContainer,
         stream_setup: VideoStreamSetup,
         output_av_container: OutputContainer,
-        video_settings: VideoSettings,
-        log_level: str | None,
-        initial_position: Fraction = Fraction(0),
-        initial_last_dts: int = -100_000_000,
+        quality: VideoExportQuality,
     ) -> None:
         self.media_container = media_container
-        self.log_level = log_level
         self.encoder_inited = False
-        self.video_settings = video_settings
+        self.quality = quality
 
         self.enc_codec = None
 
@@ -221,24 +168,13 @@ class VideoCutter:
         self.out_stream = stream_setup.out_stream
         self.codec_name = stream_setup.codec_name
 
-        if stream_setup.is_full_recode:
-            # Full recode mode - initialize encoder immediately
-            self.init_encoder()
-            self.enc_codec = self.out_stream.codec_context
-            self.enc_codec.options.update(self.encoding_options)
-            self.enc_codec.time_base = self.in_time_base
-            self.enc_codec.thread_type = "FRAME"
-            self.enc_last_pts = -1
-        else:
-            # Smartcut mode - set up bitstream filter for remuxing
-            self.remux_bitstream_filter = av.bitstream.BitStreamFilterContext('null', self.in_stream, self.out_stream)
-            if self.in_stream.codec_context.name == 'h264' and not is_annexb(self.in_stream.codec_context.extradata):
-                self.remux_bitstream_filter = av.bitstream.BitStreamFilterContext('h264_mp4toannexb', self.in_stream, self.out_stream)
-            elif self.in_stream.codec_context.name == 'hevc' and not is_annexb(self.in_stream.codec_context.extradata):
-                self.remux_bitstream_filter = av.bitstream.BitStreamFilterContext('hevc_mp4toannexb', self.in_stream, self.out_stream)
-            # MPEG-4 Visual family: optional filters for robustness (ASF/AVI tend to need this)
-            elif self.in_stream.codec_context.name in {'mpeg4', 'msmpeg4v3', 'msmpeg4v2', 'msmpeg4v1'}:
-                self.remux_bitstream_filter = av.bitstream.BitStreamFilterContext('dump_extra', self.in_stream, self.out_stream)
+        self.remux_bitstream_filter = av.bitstream.BitStreamFilterContext('null', self.in_stream, self.out_stream)
+        if self.in_stream.codec_context.name == 'h264' and not is_annexb(self.in_stream.codec_context.extradata):
+            self.remux_bitstream_filter = av.bitstream.BitStreamFilterContext('h264_mp4toannexb', self.in_stream, self.out_stream)
+        elif self.in_stream.codec_context.name == 'hevc' and not is_annexb(self.in_stream.codec_context.extradata):
+            self.remux_bitstream_filter = av.bitstream.BitStreamFilterContext('hevc_mp4toannexb', self.in_stream, self.out_stream)
+        elif self.in_stream.codec_context.name in {'mpeg4', 'msmpeg4v3', 'msmpeg4v2', 'msmpeg4v1'}:
+            self.remux_bitstream_filter = av.bitstream.BitStreamFilterContext('dump_extra', self.in_stream, self.out_stream)
 
         # Normalize codec tags for container compatibility (must be done after bitstream filter setup)
         _normalize_output_codec_tag(self.out_stream, output_av_container, self.in_stream)
@@ -252,9 +188,8 @@ class VideoCutter:
         # packets without proper duration cause last-frame discard issues
         self.typical_frame_duration: int | None = None
 
-        # Output position state - can be set for joining multiple files
-        self.last_dts = initial_last_dts
-        self.segment_start_in_output = initial_position
+        self.last_dts = -100_000_000
+        self.segment_start_in_output = Fraction(0)
 
         # Track stream continuity for hybrid CRA recoding
         self.last_remuxed_segment_gop_index = None
@@ -275,7 +210,7 @@ class VideoCutter:
             if profile is not None:
                 profile = profile[-1:]
                 if int(profile) > 1:
-                    raise ValueError("VP9 Profile 2 and Profile 3 are not supported by the encoder. Please select cutting on keyframes mode.")
+                    raise ValueError("VP9 profiles 2 and 3 are not supported")
         elif profile is not None:
             if 'Baseline' in profile:
                 profile = 'baseline'
@@ -287,12 +222,12 @@ class VideoCutter:
                 profile = profile.lower().replace(':', '').replace(' ', '')
 
         # Get CRF value for quality setting
-        crf_value = get_crf_for_quality(self.video_settings.quality)
+        crf_value = get_crf_for_quality(self.quality)
 
         # Adjust CRF for newer codecs that are more efficient
         if self.codec_name in ['hevc', 'av1', 'vp9']:
             crf_value += 4
-        if self.video_settings.quality == VideoExportQuality.LOSSLESS:
+        if self.quality == VideoExportQuality.LOSSLESS:
             crf_value = 0
 
         self.encoding_options = {'crf': str(crf_value)}
@@ -305,7 +240,7 @@ class VideoCutter:
                 'row-mt': '1',
                 'lag-in-frames': '0',
             })
-        if self.codec_name == 'vp9' and self.video_settings.quality == VideoExportQuality.LOSSLESS:
+        if self.codec_name == 'vp9' and self.quality == VideoExportQuality.LOSSLESS:
             self.encoding_options['lossless'] = '1'
         # encoding_options = {}
         if profile is not None:
@@ -353,10 +288,7 @@ class VideoCutter:
             # represent the original video's settings.
             x265_params.append('info=0')
 
-            if self.log_level is not None:
-                x265_params.append(f'log_level={self.log_level}')
-
-            if self.video_settings.quality == VideoExportQuality.LOSSLESS:
+            if self.quality == VideoExportQuality.LOSSLESS:
                 x265_params.append('lossless=1')
 
             self.encoding_options['x265-params'] = ':'.join(x265_params)

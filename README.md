@@ -8,8 +8,8 @@ The frontend and backend ship together but remain separate processes:
 
 - `mpv-smartcut.lua` owns selection, progress, cancellation, temporary files,
   atomic finalization, and cleanup.
-- `mpv-smartcut-backend` owns codec-aware smart rendering and remains usable as
-  a standalone CLI.
+- `mpv-smartcut-backend` is the minimal codec-aware worker invoked by the
+  frontend.
 
 The fork preserves the original MIT license and codec implementation. Its first
 runtime change replaces NumPy timestamp indexing with Python standard-library
@@ -36,11 +36,3 @@ quality=high
 
 Cuts are written to a hidden partial file and renamed only after success.
 Partial output is deleted when processing fails, is cancelled, or mpv exits.
-
-## Backend
-
-The backend retains the original SmartCut CLI syntax:
-
-```console
-mpv-smartcut-backend input.mkv output.mkv --keep 10,20
-```

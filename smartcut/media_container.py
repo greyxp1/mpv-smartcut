@@ -1,4 +1,3 @@
-from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
 from fractions import Fraction
 from typing import cast
@@ -18,18 +17,9 @@ from smartcut.nal_tools import (
     is_safe_h265_keyframe_nal,
 )
 
-
-def ts_to_time(ts: float) -> Fraction:
-    return Fraction(round(ts*1000), 1000)
-
-
 @dataclass
 class AudioTrack:
-    media_container: "MediaContainer"
     av_stream: AudioStream
-    path: str
-    index: int
-
     packets: list[Packet] = field(default_factory=list)
     frame_times_pts: list[int] = field(default_factory=list)
     frame_times: list[Fraction] = field(default_factory=list)
@@ -39,14 +29,10 @@ class MediaContainer:
     video_stream: VideoStream | None
     path: str
 
-    video_frame_times_pts: list[int]
-    video_frame_times: list[Fraction]
-    video_keyframe_indices: list[int]
     gop_start_times_pts_s: list[Fraction] # Smallest pts in a GOP, in seconds
 
     gop_start_times_dts: list[int]
     gop_end_times_dts: list[int]
-    gop_start_nal_types: list[int | None]  # NAL type of first picture frame after each GOP boundary
     gop_leading_end_dts: list[int | None]  # DTS of first non-leading picture in GOP (None if no leading pics)
     gop_has_rasl: list[bool]  # True if GOP has RASL frames (need priming/hybrid recode)
 
@@ -60,13 +46,10 @@ class MediaContainer:
         self.path = path
 
         frame_pts = []
-        self.video_keyframe_indices = []
+        video_keyframe_indices = []
 
         self.av_container = av_container = av_open(path, 'r', metadata_errors='ignore')
 
-        self.chat_url = None
-        self.chat_history = None
-        self.chat_visualize = True
         self.start_time = Fraction(av_container.start_time, AV_TIME_BASE) if av_container.start_time is not None else Fraction(0)
         manual_duration_calc = av_container.duration is None
         self.duration = Fraction(av_container.duration , AV_TIME_BASE) if av_container.duration is not None else Fraction(0)
@@ -95,7 +78,7 @@ class MediaContainer:
             if audio_stream.time_base is None:
                 continue
             audio_stream.codec_context.thread_type = "FRAME"
-            track = AudioTrack(self, audio_stream, path, i)
+            track = AudioTrack(audio_stream)
             self.audio_tracks.append(track)
             stream_index_to_audio_track[audio_stream.index] = track
 
@@ -114,7 +97,6 @@ class MediaContainer:
 
         self.gop_start_times_dts = []
         self.gop_end_times_dts = []
-        self.gop_start_nal_types = []
         self.gop_leading_end_dts = []
         self.gop_has_rasl = []
         last_seen_video_dts = None
@@ -158,10 +140,9 @@ class MediaContainer:
                             self.gop_leading_end_dts.append(None if not current_gop_has_leading else last_seen_video_dts)
                             self.gop_has_rasl.append(current_gop_has_rasl)
 
-                        self.video_keyframe_indices.append(len(frame_pts))
+                        video_keyframe_indices.append(len(frame_pts))
                         dts = packet.dts if packet.dts is not None else -100_000_000
                         self.gop_start_times_dts.append(dts)
-                        self.gop_start_nal_types.append(nal_type)
 
                         if last_seen_video_dts is not None:
                             self.gop_end_times_dts.append(last_seen_video_dts)
@@ -203,8 +184,6 @@ class MediaContainer:
                 frame_pts.append(packet.pts)
             elif packet.stream.type == 'audio':
                 track = stream_index_to_audio_track[packet.stream_index]
-                track.last_packet = packet
-
                 # NOTE: storing the audio packets like this keeps the whole compressed audio loaded in RAM
                 track.packets.append(packet)
             elif packet.stream.type == 'subtitle':
@@ -235,7 +214,7 @@ class MediaContainer:
                 self.gop_end_times_dts.append(fallback_dts)
             assert len(self.gop_start_times_dts) == len(self.gop_end_times_dts), \
                 f"GOP DTS array length mismatch: start={len(self.gop_start_times_dts)}, end={len(self.gop_end_times_dts)}"
-            self.video_frame_times_pts = sorted(frame_pts)
+            video_frame_times_pts = sorted(frame_pts)
 
         # Collect integer PTS arrays for audio tracks.
         for t in self.audio_tracks:
@@ -243,11 +222,11 @@ class MediaContainer:
 
         if self.video_stream is not None and self.video_stream.time_base is not None:
             video_time_base = cast(Fraction, self.video_stream.time_base)
-            self.video_frame_times = [
-                Fraction(pts) * video_time_base for pts in self.video_frame_times_pts
+            video_frame_times = [
+                Fraction(pts) * video_time_base for pts in video_frame_times_pts
             ]
             self.gop_start_times_pts_s = [
-                self.video_frame_times[index] for index in self.video_keyframe_indices
+                video_frame_times[index] for index in video_keyframe_indices
             ]
 
         for track in self.audio_tracks:
@@ -259,87 +238,3 @@ class MediaContainer:
 
     def close(self) -> None:
         self.av_container.close()
-
-    def get_next_frame_time(self, t: Fraction) -> Fraction:
-        assert self.video_stream is not None
-        t += self.start_time
-        # Convert to PTS for searching
-        t_pts = round(t / cast(Fraction, self.video_stream.time_base))
-        idx = bisect_left(self.video_frame_times_pts, t_pts)
-        if idx == len(self.video_frame_times_pts):
-            return self.duration
-        elif idx == 0:
-            return self.video_frame_times[0] - self.start_time
-        # Otherwise, find the closest of the two possible candidates: arr[idx-1] and arr[idx]
-        else:
-            prev_val = self.video_frame_times[idx - 1]
-            next_val = self.video_frame_times[idx]
-            if t - prev_val <= next_val - t:
-                return prev_val - self.start_time
-            else:
-                return next_val - self.start_time
-
-    def get_frame_time_at_or_before(self, t: Fraction) -> Fraction:
-        """Get frame time at or before the given time (snap down).
-
-        For video files: uses video frame times.
-        For audio-only files: uses first audio track's frame times.
-
-        Args:
-            t: Time in seconds (relative to start_time=0)
-
-        Returns:
-            Frame time at or before t, or 0 if t is before first frame.
-        """
-        t_absolute = t + self.start_time
-
-        if self.video_stream is not None:
-            frame_times = self.video_frame_times
-            frame_times_pts = self.video_frame_times_pts
-            time_base = cast(Fraction, self.video_stream.time_base)
-        elif self.audio_tracks:
-            track = self.audio_tracks[0]
-            frame_times = track.frame_times
-            frame_times_pts = track.frame_times_pts
-            time_base = cast(Fraction, track.av_stream.time_base)
-        else:
-            return t  # No frames to snap to
-
-        t_pts = round(t_absolute / time_base)
-        # side='right' ensures we get index after t if t is exactly on a frame boundary
-        idx = bisect_right(frame_times_pts, t_pts) - 1
-        idx = max(0, idx)
-        return frame_times[idx] - self.start_time
-
-    def get_frame_time_at_or_after(self, t: Fraction) -> Fraction:
-        """Get frame time at or after the given time (snap up).
-
-        For video files: uses video frame times.
-        For audio-only files: uses first audio track's frame times.
-
-        Args:
-            t: Time in seconds (relative to start_time=0)
-
-        Returns:
-            Frame time at or after t, or duration if t is past last frame.
-        """
-        t_absolute = t + self.start_time
-
-        if self.video_stream is not None:
-            frame_times = self.video_frame_times
-            frame_times_pts = self.video_frame_times_pts
-            time_base = cast(Fraction, self.video_stream.time_base)
-        elif self.audio_tracks:
-            track = self.audio_tracks[0]
-            frame_times = track.frame_times
-            frame_times_pts = track.frame_times_pts
-            time_base = cast(Fraction, track.av_stream.time_base)
-        else:
-            return t  # No frames to snap to
-
-        t_pts = round(t_absolute / time_base)
-        # side='left' ensures we get index of frame at or after t
-        idx = bisect_left(frame_times_pts, t_pts)
-        if idx >= len(frame_times):
-            return self.duration
-        return frame_times[idx] - self.start_time

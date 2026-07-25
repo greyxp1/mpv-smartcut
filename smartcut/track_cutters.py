@@ -17,11 +17,6 @@ def create_audio_output_stream(
     output_av_container: OutputContainer,
     track_index: int,
 ) -> AudioStream:
-    """
-    Create output audio stream from source media container.
-
-    Separated from PassthruAudioCutter to allow reuse in joining operations.
-    """
     track = media_container.audio_tracks[track_index]
     out_stream = output_av_container.add_stream_from_template(
         track.av_stream,
@@ -38,17 +33,12 @@ class PassthruAudioCutter:
         media_container: MediaContainer,
         out_stream: AudioStream,
         track_index: int,
-        initial_position: Fraction = Fraction(0),
-        initial_prev_dts: int = -100_000,
-        initial_prev_pts: int = -100_000,
     ) -> None:
         self.track = media_container.audio_tracks[track_index]
         self.out_stream = out_stream
-
-        # Output position state - can be set for joining multiple files
-        self.segment_start_in_output = initial_position
-        self.prev_dts = initial_prev_dts
-        self.prev_pts = initial_prev_pts
+        self.segment_start_in_output = Fraction(0)
+        self.prev_dts = -100_000
+        self.prev_pts = -100_000
 
     def segment(self, cut_segment: CutSegment) -> list[Packet]:
         in_tb = cast(Fraction, self.track.av_stream.time_base)
@@ -91,11 +81,6 @@ def create_subtitle_output_stream(
     output_av_container: OutputContainer,
     track_index: int,
 ) -> Stream:
-    """
-    Create output subtitle stream from source media container.
-
-    Separated from SubtitleCutter to allow reuse in joining operations.
-    """
     in_stream = media_container.av_container.streams.subtitles[track_index]
     out_stream = output_av_container.add_stream_from_template(in_stream)
     out_stream.metadata.update(in_stream.metadata)
@@ -109,18 +94,12 @@ class SubtitleCutter:
         media_container: MediaContainer,
         out_stream: Stream,
         track_index: int,
-        initial_position: Fraction = Fraction(0),
-        initial_prev_pts: int = -100_000,
     ) -> None:
-        self.track_i = track_index
         self.packets = media_container.subtitle_tracks[track_index]
         self.in_stream = media_container.av_container.streams.subtitles[track_index]
         self.out_stream = out_stream
-
-        # Output position state - can be set for joining multiple files
-        self.segment_start_in_output = initial_position
-        self.prev_pts = initial_prev_pts
-
+        self.segment_start_in_output = Fraction(0)
+        self.prev_pts = -100_000
         self.current_packet_i = 0
 
     def segment(self, cut_segment: CutSegment) -> list[Packet]:
@@ -137,7 +116,7 @@ class SubtitleCutter:
             p = self.packets[self.current_packet_i]
             if p.pts < segment_start_pts:
                 self.current_packet_i += 1
-            elif p.pts >= segment_start_pts and p.pts < segment_end_pts:
+            elif p.pts < segment_end_pts:
                 out_packets.append(p)
                 self.current_packet_i += 1
             else:
@@ -152,7 +131,6 @@ class SubtitleCutter:
                 packet.pts = self.prev_pts + 1
             packet.dts = packet.pts
             self.prev_pts = packet.pts
-            self.prev_dts = packet.dts
 
         self.segment_start_in_output += cut_segment.end_time - cut_segment.start_time
         return out_packets

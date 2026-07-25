@@ -1,12 +1,4 @@
-"""Video export modes and quality presets."""
-
 from enum import Enum
-
-
-class VideoExportMode(Enum):
-    SMARTCUT = 1
-    KEYFRAMES = 2
-    RECODE = 3
 
 
 class VideoExportQuality(Enum):
@@ -19,7 +11,6 @@ class VideoExportQuality(Enum):
 
 
 def get_crf_for_quality(quality: VideoExportQuality) -> int:
-    """Return the CRF for a quality preset."""
     return {
         VideoExportQuality.LOW: 23,
         VideoExportQuality.NORMAL: 18,
@@ -27,4 +18,4 @@ def get_crf_for_quality(quality: VideoExportQuality) -> int:
         VideoExportQuality.INDISTINGUISHABLE: 8,
         VideoExportQuality.NEAR_LOSSLESS: 3,
         VideoExportQuality.LOSSLESS: 0,
-    }.get(quality, 18)
+    }[quality]

@@ -1,14 +1,6 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from fractions import Fraction
 
-
-@dataclass
-class AudioExportSettings:
-    codec: str
-
-@dataclass
-class AudioExportInfo:
-    output_tracks: list[AudioExportSettings | None] = field(default_factory=list)
 
 @dataclass
 class CutSegment:
