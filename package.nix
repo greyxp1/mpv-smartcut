@@ -15,8 +15,6 @@ python3Packages.buildPythonApplication {
   postInstall = ''
     install -Dm444 mpv-smartcut.lua \
       "$out/share/mpv/scripts/mpv-smartcut.lua"
-    install -Dm444 mpv-smartcut.conf.example \
-      "$out/share/mpv/script-opts/mpv-smartcut.conf"
   '';
 
   nativeInstallCheckInputs = [lua5_4];

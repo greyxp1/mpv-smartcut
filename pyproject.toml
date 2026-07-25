@@ -9,9 +9,7 @@ description = "Frame-accurate smart cutting backend and mpv frontend"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
-authors = [
-    {name = "greyxp1"}
-]
+authors = [{name = "greyxp1"}]
 keywords = [
     "video", "cutting", "editing", "ffmpeg", "mpv", "smart-cut", "lossless",
     "frame-accurate", "cli", "video-processing",
@@ -26,9 +24,7 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Operating System :: OS Independent",
 ]
-dependencies = [
-    "av>=16,<18",
-]
+dependencies = ["av>=16,<18"]
 
 [project.optional-dependencies]
 test = [
@@ -39,11 +35,6 @@ test = [
     "requests",
     "psutil",
 ]
-dev = [
-    "build",
-    "twine",
-    "pyinstaller",
-]
 
 [project.scripts]
 smartcut = "smartcut.__main__:main"
@@ -51,9 +42,6 @@ mpv-smartcut-backend = "smartcut.__main__:main"
 
 [tool.setuptools]
 packages = ["smartcut"]
-
-[tool.setuptools.package-data]
-smartcut = ["py.typed"]
 
 [tool.ruff]
 line-length = 300
