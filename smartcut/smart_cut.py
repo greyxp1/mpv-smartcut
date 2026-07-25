@@ -22,7 +22,7 @@ from smartcut.video_cutter import (
     create_video_output_stream,
 )
 
-__version__ = "1.7"
+__version__ = "0.1.0"
 
 
 class ProgressCallback(Protocol):
@@ -134,7 +134,7 @@ def smart_cut(media_container: MediaContainer, positive_segments: list[tuple[Fra
         if cancel_object is not None and cancel_object.cancelled:
             break
         with av.open(output_path_segment[0], 'w') as output_av_container:
-            output_av_container.metadata['ENCODED_BY'] = f'smartcut {__version__}'
+            output_av_container.metadata['ENCODED_BY'] = f'mpv-smartcut {__version__}'
 
             include_video = True
             if output_av_container.format.name in ['ogg', 'mp3', 'm4a', 'ipod', 'flac', 'wav']: #ipod is the real name for m4a, I guess

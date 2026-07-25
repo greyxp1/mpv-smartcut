@@ -4,8 +4,8 @@
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
   outputs = {
-    self,
     nixpkgs,
+    ...
   }: let
     forAllSystems = nixpkgs.lib.genAttrs [
       "x86_64-linux"
@@ -16,7 +16,6 @@
       pkgs = import nixpkgs {inherit system;};
     in {
       default = pkgs.callPackage ./package.nix {};
-      mpv-smartcut = self.packages.${system}.default;
     });
   };
 }

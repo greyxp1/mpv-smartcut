@@ -196,49 +196,8 @@ def restore_negative_numbers(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    description = (
-        "SmartCut - Efficient video cutting with minimal recoding. "
-        "Only segments around cutpoints are re-encoded, preserving original quality "
-        "for the majority of the video. Supports various formats including MP4, MKV, AVI, MOV."
-    )
-
-    epilog = """
-examples:
-  Keep segments from 10-20s and 40-50s:
-    smartcut input.mp4 output.mp4 --keep 10,20,40,50
-    smartcut input.mp4 output.mp4 -k 10,20,40,50
-
-  Cut out segments from 30-40s and 1m-1m10s:
-    smartcut input.mp4 output.mp4 --cut 30,40,01:00,01:10
-    smartcut input.mp4 output.mp4 -c 30,40,01:00,01:10
-
-  Keep from start to 30s, then from 1m to end:
-    smartcut input.mp4 output.mp4 -k start,30,01:00,end
-    smartcut input.mp4 output.mp4 -k s,30,60,e
-
-  Cut the last 5 seconds of the file:
-    smartcut input.mp4 output.mp4 -c -5,end
-    smartcut input.mp4 output.mp4 -c -5,-0
-
-  Use frame numbers instead of times:
-    smartcut input.mp4 output.mp4 --keep 300,600,1200,1500 --frames
-
-  Subsecond precision cutting:
-    smartcut input.mp4 output.mp4 --keep 00:06:48.799,00:06:50.123
-
-time formats:
-  - Seconds: 10, 30.5, 120
-  - MM:SS: 01:30, 02:45
-  - HH:MM:SS: 01:30:45
-  - Subseconds: 48.799, 01:30.123, 01:30:45.678
-  - Negative (from end): -5 (5s from end), -1:30 (1m30s from end)
-  - Keywords: s/start (beginning), e/end/-0 (end of file)
-"""
-
     parser = argparse.ArgumentParser(
-        description=description,
-        epilog=epilog,
-        formatter_class=argparse.RawDescriptionHelpFormatter
+        description="Frame-accurate cutting with minimal re-encoding.",
     )
 
     parser.add_argument('input', metavar='INPUT', type=str,
@@ -263,7 +222,7 @@ time formats:
                        help="Write machine-readable completed,total progress to PATH")
     parser.add_argument('--quality', choices=QUALITY_PRESETS, default='normal',
                        help="Quality for re-encoded boundary GOPs (default: %(default)s)")
-    parser.add_argument('--version', action='version', version=f'Smartcut {__version__}')
+    parser.add_argument('--version', action='version', version=f'mpv-smartcut {__version__}')
 
     # Preprocess argv to handle negative numbers in -k/-c arguments
     processed_argv = preprocess_argv_for_negative_numbers(sys.argv[1:])

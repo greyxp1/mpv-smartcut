@@ -5,14 +5,10 @@ from fractions import Fraction
 @dataclass
 class AudioExportSettings:
     codec: str
-    channels: str | None = None
-    bitrate: int | None = None
-    sample_rate: int | None = None
-    denoise: int = -1
 
 @dataclass
 class AudioExportInfo:
-    output_tracks: list[AudioExportSettings | None] = field(default_factory=lambda: [])
+    output_tracks: list[AudioExportSettings | None] = field(default_factory=list)
 
 @dataclass
 class CutSegment:
