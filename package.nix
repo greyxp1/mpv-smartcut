@@ -24,7 +24,7 @@ python3Packages.buildPythonApplication {
     luac -p mpv-smartcut.lua
     runHook postInstallCheck
   '';
-  pythonImportsCheck = ["smartcut"];
+  pythonImportsCheck = ["smartcut.__main__"];
 
   meta = {
     description = "Frame-accurate smart cutting backend and mpv frontend";

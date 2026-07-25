@@ -15,9 +15,27 @@ from av.stream import Disposition
 from av.video.frame import PictureType, VideoFrame
 
 from smartcut.media_container import MediaContainer
-from smartcut.media_utils import VideoExportQuality, get_crf_for_quality
-from smartcut.misc_data import CutSegment
 from smartcut.nal_tools import get_h265_nal_unit_type, is_leading_picture_nal_type
+
+
+@dataclass
+class CutSegment:
+    require_recode: bool
+    start_time: Fraction
+    end_time: Fraction
+    gop_start_dts: int = -1
+    gop_end_dts: int = -1
+    gop_index: int = -1
+
+
+CRF_BY_QUALITY = {
+    "low": 23,
+    "normal": 18,
+    "high": 14,
+    "indistinguishable": 8,
+    "near-lossless": 3,
+    "lossless": 0,
+}
 
 
 @dataclass
@@ -33,24 +51,21 @@ class FrameHeapItem:
         return self_pts < other_pts
 
 def is_annexb(packet: Packet | bytes | None) -> bool:
-        if packet is None:
-            return False
-        data = bytes(packet)
-        return data[:3] == b'\0\0\x01' or data[:4] == b'\0\0\0\x01'
+    if packet is None:
+        return False
+    data = bytes(packet)
+    return data[:3] == b'\0\0\x01' or data[:4] == b'\0\0\0\x01'
 
 def copy_packet(p: Packet) -> Packet:
-    # return p
     packet = Packet(bytes(p))
     packet.pts = p.pts
     packet.dts = p.dts
     packet.duration = p.duration
-    # packet.pos = p.pos
     packet.time_base = p.time_base
     packet.stream = p.stream
     packet.is_keyframe = p.is_keyframe
     for side_data in p.iter_sidedata():
         packet.set_sidedata(side_data)
-    # packet.is_discard = p.is_discard
 
     return packet
 
@@ -82,18 +97,15 @@ def create_video_output_stream(
         out_stream.height = in_stream.height
         if in_stream.sample_aspect_ratio is not None:
             out_stream.sample_aspect_ratio = in_stream.sample_aspect_ratio
-        out_stream.metadata.update(in_stream.metadata)
-        out_stream.disposition = cast(Disposition, in_stream.disposition.value)
-        out_stream.time_base = in_stream.time_base
     else:
         out_stream = output_av_container.add_stream_from_template(
             in_stream,
             options={"x265-params": "log_level=error"},
         )
-        out_stream.metadata.update(in_stream.metadata)
-        out_stream.disposition = cast(Disposition, in_stream.disposition.value)
-        out_stream.time_base = in_stream.time_base
 
+    out_stream.metadata.update(in_stream.metadata)
+    out_stream.disposition = cast(Disposition, in_stream.disposition.value)
+    out_stream.time_base = in_stream.time_base
     assert out_stream.time_base is not None, "Output stream must have a time_base"
     return VideoStreamSetup(out_stream, codec_name)
 
@@ -114,24 +126,14 @@ def _normalize_output_codec_tag(
 
     # Normalize MPEG-TS codec tags for MP4/MOV/MKV containers
     # Check INPUT stream's codec_tag since output may not have been populated yet
-    if is_mp4_mov_mkv and in_codec_name == 'h264' and _is_mpegts_h264_tag(in_codec_ctx.codec_tag):
+    if is_mp4_mov_mkv and in_codec_name == 'h264' and in_codec_ctx.codec_tag == '\x1b\x00\x00\x00':
         out_codec_ctx.codec_tag = 'avc1'
 
     # For HEVC in MP4/MOV: use hev1 to keep VPS/SPS/PPS inline
     if is_mp4_or_mov and in_codec_name in ('hevc', 'h265'):
         out_codec_ctx.codec_tag = 'hev1'
-    elif is_mp4_mov_mkv and in_codec_name in ('hevc', 'h265') and _is_mpegts_hevc_tag(in_codec_ctx.codec_tag):
+    elif is_mp4_mov_mkv and in_codec_name in ('hevc', 'h265') and in_codec_ctx.codec_tag in ('HEVC', '\x24\x00\x00\x00'):
         out_codec_ctx.codec_tag = 'hvc1'
-
-
-def _is_mpegts_h264_tag(codec_tag: str) -> bool:
-    """Check if codec tag is MPEG-TS style H.264 tag."""
-    return codec_tag == '\x1b\x00\x00\x00'
-
-
-def _is_mpegts_hevc_tag(codec_tag: str) -> bool:
-    """Check if codec tag is MPEG-TS style HEVC tag."""
-    return codec_tag in ('HEVC', '\x24\x00\x00\x00')
 
 
 class VideoCutter:
@@ -140,7 +142,7 @@ class VideoCutter:
         media_container: MediaContainer,
         stream_setup: VideoStreamSetup,
         output_av_container: OutputContainer,
-        quality: VideoExportQuality,
+        quality: str,
     ) -> None:
         self.media_container = media_container
         self.encoder_inited = False
@@ -199,7 +201,6 @@ class VideoCutter:
 
     def init_encoder(self) -> None:
         self.encoder_inited = True
-        # v_codec = self.in_stream.codec_context
         profile = self.out_stream.codec_context.profile
 
         codec_name = self.codec_name or ''
@@ -221,13 +222,12 @@ class VideoCutter:
             else:
                 profile = profile.lower().replace(':', '').replace(' ', '')
 
-        # Get CRF value for quality setting
-        crf_value = get_crf_for_quality(self.quality)
+        crf_value = CRF_BY_QUALITY[self.quality]
 
         # Adjust CRF for newer codecs that are more efficient
         if self.codec_name in ['hevc', 'av1', 'vp9']:
             crf_value += 4
-        if self.quality == VideoExportQuality.LOSSLESS:
+        if self.quality == "lossless":
             crf_value = 0
 
         self.encoding_options = {'crf': str(crf_value)}
@@ -240,9 +240,8 @@ class VideoCutter:
                 'row-mt': '1',
                 'lag-in-frames': '0',
             })
-        if self.codec_name == 'vp9' and self.quality == VideoExportQuality.LOSSLESS:
+        if self.codec_name == 'vp9' and self.quality == "lossless":
             self.encoding_options['lossless'] = '1'
-        # encoding_options = {}
         if profile is not None:
             self.encoding_options['profile'] = profile
 
@@ -254,13 +253,7 @@ class VideoCutter:
             self.encoding_options['x264-params'] = 'sps-id=3'
 
         elif self.codec_name == 'hevc':
-            # Get the encoder settings from input stream extradata.
-            # In theory this should not work. The stuff in extradata is technically just comments set by the encoder.
-            # Another issue is that the extradata format is going to be different depending on the encoder.
-            # So this will likely only work if the input stream is encoded with x265 ¯\_(ツ)_/¯
-            # However, this does make the testcases from fails -> passes.
-            # And I've tested that it works on some real videos as well.
-            # Maybe there is some option that I'm not setting correctly and there is a better way to get the correct value?
+            # Preserve x265 parameters embedded in the input extradata when available.
 
             assert self.in_stream is not None
             assert self.in_stream.codec_context is not None
@@ -288,7 +281,7 @@ class VideoCutter:
             # represent the original video's settings.
             x265_params.append('info=0')
 
-            if self.quality == VideoExportQuality.LOSSLESS:
+            if self.quality == "lossless":
                 x265_params.append('lossless=1')
 
             self.encoding_options['x265-params'] = ':'.join(x265_params)
@@ -347,11 +340,6 @@ class VideoCutter:
         if muxing_codec.rate is not None:
             enc_codec.rate = muxing_codec.rate
         enc_codec.options.update(self.encoding_options)
-
-        # Leaving this here for future consideration: manually setting the bframe count seems to make sense in principle.
-        # But atleast in the test suite, it seemed to cause more issues that in solves.
-        # metadata_b_frames = max(self.in_stream.codec_context.max_b_frames, 1 if self.in_stream.codec_context.has_b_frames else 0)
-        # enc_codec.max_b_frames = metadata_b_frames
 
         enc_codec.width = muxing_codec.width
         enc_codec.height = muxing_codec.height
@@ -645,7 +633,6 @@ class VideoCutter:
                 diff = (target_dts - in_dts) * self.in_time_base
                 if in_dts > 0 and diff > 120:
                     t = int(target_dts - 30 / self.in_time_base)
-                    # print(f"Seeking to skip a gap: {float(t * tb)}")
                     self.input_av_container.seek(t, stream = self.in_stream)
                     # Clear saved packet after seek since iterator position changed
                     self.demux_saved_packet = None

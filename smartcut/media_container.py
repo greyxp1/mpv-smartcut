@@ -22,7 +22,6 @@ class AudioTrack:
     av_stream: AudioStream
     packets: list[Packet] = field(default_factory=list)
     frame_times_pts: list[int] = field(default_factory=list)
-    frame_times: list[Fraction] = field(default_factory=list)
 
 class MediaContainer:
     av_container: InputContainer
@@ -74,7 +73,7 @@ class MediaContainer:
 
         self.audio_tracks = []
         stream_index_to_audio_track = {}
-        for i, audio_stream in enumerate(av_container.streams.audio):
+        for audio_stream in av_container.streams.audio:
             if audio_stream.time_base is None:
                 continue
             audio_stream.codec_context.thread_type = "FRAME"
@@ -222,19 +221,10 @@ class MediaContainer:
 
         if self.video_stream is not None and self.video_stream.time_base is not None:
             video_time_base = cast(Fraction, self.video_stream.time_base)
-            video_frame_times = [
-                Fraction(pts) * video_time_base for pts in video_frame_times_pts
-            ]
             self.gop_start_times_pts_s = [
-                video_frame_times[index] for index in video_keyframe_indices
+                Fraction(video_frame_times_pts[index]) * video_time_base
+                for index in video_keyframe_indices
             ]
-
-        for track in self.audio_tracks:
-            if track.av_stream.time_base is not None:
-                audio_time_base = cast(Fraction, track.av_stream.time_base)
-                track.frame_times = [
-                    Fraction(pts) * audio_time_base for pts in track.frame_times_pts
-                ]
 
     def close(self) -> None:
         self.av_container.close()

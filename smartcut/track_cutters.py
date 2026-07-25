@@ -8,8 +8,7 @@ from av.packet import Packet
 from av.stream import Disposition, Stream
 
 from smartcut.media_container import MediaContainer
-from smartcut.misc_data import CutSegment
-from smartcut.video_cutter import copy_packet
+from smartcut.video_cutter import CutSegment, copy_packet
 
 
 def create_audio_output_stream(
@@ -18,10 +17,7 @@ def create_audio_output_stream(
     track_index: int,
 ) -> AudioStream:
     track = media_container.audio_tracks[track_index]
-    out_stream = output_av_container.add_stream_from_template(
-        track.av_stream,
-        options={'x265-params': 'log_level=error'}
-    )
+    out_stream = output_av_container.add_stream_from_template(track.av_stream)
     out_stream.metadata.update(track.av_stream.metadata)
     out_stream.disposition = cast(Disposition, track.av_stream.disposition.value)
     return out_stream
@@ -55,15 +51,12 @@ class PassthruAudioCutter:
             if p.dts is None or p.pts is None:
                 continue
             packet = copy_packet(p)
-            # packet = p
             packet.stream = self.out_stream
             packet.pts = int(p.pts + (self.segment_start_in_output - cut_segment.start_time) / in_tb)
             packet.dts = int(p.dts + (self.segment_start_in_output - cut_segment.start_time) / in_tb)
             if packet.pts <= self.prev_pts:
-                print("Correcting for too low pts in audio passthru")
                 packet.pts = self.prev_pts + 1
             if packet.dts <= self.prev_dts:
-                print("Correcting for too low dts in audio passthru")
                 packet.dts = self.prev_dts + 1
             self.prev_pts = packet.pts
             self.prev_dts = packet.dts
@@ -127,7 +120,6 @@ class SubtitleCutter:
             packet.pts = int(packet.pts - segment_start_pts + self.segment_start_in_output / in_tb)
 
             if packet.pts < self.prev_pts:
-                print("Correcting for too low pts in subtitle passthru. This should not happen.")
                 packet.pts = self.prev_pts + 1
             packet.dts = packet.pts
             self.prev_pts = packet.pts

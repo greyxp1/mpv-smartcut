@@ -1,34 +1,10 @@
-import argparse
 import os
+import sys
 import time
 from fractions import Fraction
 
 from smartcut.media_container import MediaContainer
-from smartcut.media_utils import VideoExportQuality
 from smartcut.smart_cut import smart_cut
-
-QUALITY_PRESETS = {
-    "low": VideoExportQuality.LOW,
-    "normal": VideoExportQuality.NORMAL,
-    "high": VideoExportQuality.HIGH,
-    "indistinguishable": VideoExportQuality.INDISTINGUISHABLE,
-    "near-lossless": VideoExportQuality.NEAR_LOSSLESS,
-    "lossless": VideoExportQuality.LOSSLESS,
-}
-
-
-def parse_range(value: str) -> tuple[Fraction, Fraction]:
-    try:
-        start_text, end_text = value.split(",")
-        start = Fraction(start_text)
-        end = Fraction(end_text)
-    except (ValueError, ZeroDivisionError) as error:
-        raise argparse.ArgumentTypeError("range must be START,END in seconds") from error
-
-    if start < 0 or end <= start:
-        raise argparse.ArgumentTypeError("range must satisfy 0 <= START < END")
-    return start, end
-
 
 class Progress:
     def __init__(self, path: str) -> None:
@@ -48,22 +24,15 @@ class Progress:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("input")
-    parser.add_argument("output")
-    parser.add_argument("--keep", required=True, type=parse_range)
-    parser.add_argument("--progress-file", required=True)
-    parser.add_argument("--quality", required=True, choices=QUALITY_PRESETS)
-    args = parser.parse_args()
-
-    source = MediaContainer(args.input)
+    input_path, output_path, start, end, progress_path, quality = sys.argv[1:]
+    source = MediaContainer(input_path)
     try:
         smart_cut(
             source,
-            args.keep,
-            args.output,
-            QUALITY_PRESETS[args.quality],
-            Progress(args.progress_file),
+            (Fraction(start), Fraction(end)),
+            output_path,
+            quality,
+            Progress(progress_path),
         )
     finally:
         source.close()

@@ -5,15 +5,13 @@ import av
 from av.packet import Packet
 
 from smartcut.media_container import MediaContainer
-from smartcut.media_utils import VideoExportQuality
-from smartcut.misc_data import CutSegment
 from smartcut.track_cutters import (
     PassthruAudioCutter,
     SubtitleCutter,
     create_audio_output_stream,
     create_subtitle_output_stream,
 )
-from smartcut.video_cutter import VideoCutter, create_video_output_stream
+from smartcut.video_cutter import CutSegment, VideoCutter, create_video_output_stream
 
 class Progress(Protocol):
     def emit(self, completed: int, total: int) -> None: ...
@@ -47,8 +45,9 @@ def make_cut_segments(
         if not media_container.audio_tracks:
             raise ValueError("input has no audio or video streams")
         track = media_container.audio_tracks[0]
-        start = max(start, track.frame_times[0])
-        end = min(end, track.frame_times[-1] + Fraction(1, 10_000))
+        time_base = Fraction(track.av_stream.time_base)
+        start = max(start, Fraction(track.frame_times_pts[0]) * time_base)
+        end = min(end, Fraction(track.frame_times_pts[-1]) * time_base + Fraction(1, 10_000))
         return [CutSegment(False, start, end)]
 
     gop_starts = [
@@ -87,7 +86,7 @@ def smart_cut(
     media_container: MediaContainer,
     selection: tuple[Fraction, Fraction],
     output_path: str,
-    quality: VideoExportQuality,
+    quality: str,
     progress: Progress,
 ) -> None:
     cut_segments = make_cut_segments(

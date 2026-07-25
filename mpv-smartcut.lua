@@ -113,37 +113,40 @@ local function choose_output(input)
     end
 end
 
-local function finish_job(success, result, error_message, job_output, job_temporary, job_progress)
+local function clear_job()
     task = nil
     progress_timer:kill()
-    remove_file(job_progress)
-    remove_file(job_progress .. ".tmp")
+    cancelling = false
+    temporary_output, final_output, progress_path = nil, nil, nil
+    hide_status()
+end
+
+local function finish_job(success, result, error_message)
+    local output = final_output
+    local partial = temporary_output
+    remove_file(progress_path)
+    remove_file(progress_path .. ".tmp")
 
     if cancelling then
-        remove_file(job_temporary)
-        cancelling = false
-        temporary_output, final_output, progress_path = nil, nil, nil
-        hide_status()
+        remove_file(partial)
+        clear_job()
         notify("Cut cancelled", 2)
         return
     end
 
     if success and result and result.status == 0 then
-        local renamed, rename_error = os.rename(job_temporary, job_output)
-        temporary_output, final_output, progress_path = nil, nil, nil
-        hide_status()
+        local renamed, rename_error = os.rename(partial, output)
+        clear_job()
         if renamed then
-            notify("Cut complete: " .. job_output, 5)
+            notify("Cut complete: " .. output, 5)
         else
             mp.msg.error("Could not finalize cut: " .. tostring(rename_error))
-            notify("Cut completed but could not be renamed: " .. job_temporary, 8)
+            notify("Cut completed but could not be renamed: " .. partial, 8)
         end
         return
     end
 
-    remove_file(job_temporary)
-    temporary_output, final_output, progress_path = nil, nil, nil
-    hide_status()
+    remove_file(partial)
 
     local detail = error_message
     if not detail and result then
@@ -155,6 +158,7 @@ local function finish_job(success, result, error_message, job_output, job_tempor
     end
     detail = detail and tostring(detail):gsub("%s+$", "") or "unknown error"
     if #detail > 500 then detail = detail:sub(-500) end
+    clear_job()
     mp.msg.error("Cut failed: " .. detail)
     notify("Cut failed: " .. detail, 8)
 end
@@ -175,9 +179,6 @@ local function start_cut(first, second)
 
     final_output, temporary_output = choose_output(input)
     progress_path = temporary_output .. ".progress"
-    local job_output = final_output
-    local job_temporary = temporary_output
-    local job_progress = progress_path
 
     started = mp.get_time()
     show_status("Smart cutting • 0s • " .. opts.cancel_key .. " cancel")
@@ -188,19 +189,17 @@ local function start_cut(first, second)
         args = {
             opts.backend,
             input,
-            job_temporary,
-            "--keep",
-            string.format("%.9f,%.9f", cut_start, cut_end),
-            "--progress-file",
-            job_progress,
-            "--quality",
+            temporary_output,
+            string.format("%.9f", cut_start),
+            string.format("%.9f", cut_end),
+            progress_path,
             opts.quality,
         },
         playback_only = false,
         capture_stderr = true,
         capture_size = 1048576,
     }, function(success, result, error_message)
-        finish_job(success, result, error_message, job_output, job_temporary, job_progress)
+        finish_job(success, result, error_message)
     end)
 end
 
