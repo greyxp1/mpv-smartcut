@@ -1,0 +1,105 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mpv-smartcut"
+version = "0.1.0"
+description = "Frame-accurate smart cutting backend and mpv frontend"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [
+    {name = "greyxp1"}
+]
+keywords = [
+    "video", "cutting", "editing", "ffmpeg", "mpv", "smart-cut", "lossless",
+    "frame-accurate", "cli", "video-processing",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: End Users/Desktop",
+    "Intended Audience :: Developers",
+    "Topic :: Multimedia :: Video :: Conversion",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "av>=16,<18",
+]
+
+[project.optional-dependencies]
+test = [
+    "numpy",
+    "ffmpeg-python",
+    "soundfile",
+    "scipy",
+    "requests",
+    "psutil",
+]
+dev = [
+    "build",
+    "twine",
+    "pyinstaller",
+]
+
+[project.scripts]
+smartcut = "smartcut.__main__:main"
+mpv-smartcut-backend = "smartcut.__main__:main"
+
+[tool.setuptools]
+packages = ["smartcut"]
+
+[tool.setuptools.package-data]
+smartcut = ["py.typed"]
+
+[tool.ruff]
+line-length = 300
+exclude = ["smartcut/parse_h265.py"]  # Experimental H.265 parser, not production code
+
+[tool.ruff.lint]
+# Select specific rules to check
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # pyflakes
+    "UP",     # pyupgrade
+    "B",      # flake8-bugbear
+    "SIM",    # flake8-simplify
+    "I",      # isort
+    "PLC",    # pylint conventions
+    "PLE",    # pylint errors
+    "PLR",    # pylint refactor
+    "PLW",    # pylint warnings
+    "RUF",    # ruff-specific rules
+    "ANN",    # type annotations
+]
+
+# Ignore specific rules that are not relevant for this project
+ignore = [
+    "PLR2004",  # Magic value used in comparison
+    "PLR0912",  # Too many branches
+    "PLR0915",  # Too many statements
+    "PLR0913",  # Too many arguments
+    "PLR0911",  # Too many return statements
+    "B905",     # zip without strict= parameter
+    "PLW2901",  # for loop variable overwritten
+]
+
+[tool.ruff.format]
+# Use double quotes for strings
+quote-style = "double"
+# Use spaces for indentation
+indent-style = "space"
+
+[tool.pyright]
+include = ["smartcut", "tests"]
+exclude = ["smartcut/parse_h265.py"]  # Experimental H.265 parser, not production code
+venvPath = "."
+venv = "venv"
+reportUnusedVariable = "warning"
+reportUnusedFunction = "warning"
+reportUnusedClass = "warning"
+reportUnusedImport = "warning"
