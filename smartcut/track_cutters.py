@@ -37,7 +37,7 @@ class PassthruAudioCutter:
         self.prev_pts = -100_000
 
     def segment(self, cut_segment: CutSegment) -> list[Packet]:
-        in_tb = cast(Fraction, self.track.av_stream.time_base)
+        in_tb = Fraction(self.track.av_stream.time_base)
         if cut_segment.start_time <= 0:
             start = 0
         else:
@@ -96,7 +96,7 @@ class SubtitleCutter:
         self.current_packet_i = 0
 
     def segment(self, cut_segment: CutSegment) -> list[Packet]:
-        in_tb = cast(Fraction, self.in_stream.time_base)
+        in_tb = Fraction(self.in_stream.time_base)
         segment_start_pts = int(cut_segment.start_time / in_tb)
         segment_end_pts = int(cut_segment.end_time / in_tb)
 

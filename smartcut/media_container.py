@@ -47,7 +47,7 @@ class MediaContainer:
         frame_pts = []
         video_keyframe_indices = []
 
-        self.av_container = av_container = av_open(path, 'r', metadata_errors='ignore')
+        self.av_container = av_container = av_open(path, 'r')
 
         self.start_time = Fraction(av_container.start_time, AV_TIME_BASE) if av_container.start_time is not None else Fraction(0)
         manual_duration_calc = av_container.duration is None
@@ -74,7 +74,7 @@ class MediaContainer:
         self.audio_tracks = []
         stream_index_to_audio_track = {}
         for audio_stream in av_container.streams.audio:
-            if audio_stream.time_base is None:
+            if not audio_stream.time_base:
                 continue
             audio_stream.codec_context.thread_type = "FRAME"
             track = AudioTrack(audio_stream)
@@ -192,9 +192,9 @@ class MediaContainer:
         if manual_duration_calc and max_end_pts_by_stream:
             for stream_idx, max_pts in max_end_pts_by_stream.items():
                 stream = av_container.streams[stream_idx]
-                if stream.time_base is None:
+                if not stream.time_base:
                     continue
-                stream_duration = Fraction(max_pts) * stream.time_base
+                stream_duration = max_pts * Fraction(stream.time_base)
                 if stream_duration > self.duration:
                     self.duration = stream_duration
 
@@ -219,8 +219,8 @@ class MediaContainer:
         for t in self.audio_tracks:
             t.frame_times_pts = [cast(int, packet.pts) for packet in t.packets]
 
-        if self.video_stream is not None and self.video_stream.time_base is not None:
-            video_time_base = cast(Fraction, self.video_stream.time_base)
+        if self.video_stream is not None and self.video_stream.time_base:
+            video_time_base = Fraction(self.video_stream.time_base)
             self.gop_start_times_pts_s = [
                 Fraction(video_frame_times_pts[index]) * video_time_base
                 for index in video_keyframe_indices

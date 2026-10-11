@@ -81,7 +81,7 @@ def create_video_output_stream(
     output_av_container: OutputContainer,
 ) -> VideoStreamSetup:
     in_stream = cast(VideoStream, media_container.video_stream)
-    assert in_stream.time_base is not None, "Video stream must have a time_base"
+    assert in_stream.time_base, "Video stream must have a time_base"
 
     original_codec_name = in_stream.codec_context.name
     codec_name = {
@@ -95,7 +95,7 @@ def create_video_output_stream(
         ))
         out_stream.width = in_stream.width
         out_stream.height = in_stream.height
-        if in_stream.sample_aspect_ratio is not None:
+        if in_stream.sample_aspect_ratio:
             out_stream.sample_aspect_ratio = in_stream.sample_aspect_ratio
     else:
         out_stream = output_av_container.add_stream_from_template(
@@ -106,7 +106,7 @@ def create_video_output_stream(
     out_stream.metadata.update(in_stream.metadata)
     out_stream.disposition = cast(Disposition, in_stream.disposition.value)
     out_stream.time_base = in_stream.time_base
-    assert out_stream.time_base is not None, "Output stream must have a time_base"
+    assert out_stream.time_base, "Output stream must have a time_base"
     return VideoStreamSetup(out_stream, codec_name)
 
 
@@ -151,12 +151,11 @@ class VideoCutter:
         self.enc_codec = None
 
         self.in_stream = cast(VideoStream, media_container.video_stream)
-        # Assert time_base is not None once at initialization
-        assert self.in_stream.time_base is not None, "Video stream must have a time_base"
-        self.in_time_base: Fraction = self.in_stream.time_base
+        assert self.in_stream.time_base, "Video stream must have a time_base"
+        self.in_time_base = Fraction(self.in_stream.time_base)
 
         # Open another container because seeking to beginning of the file is unreliable...
-        self.input_av_container: InputContainer = av.open(media_container.path, 'r', metadata_errors='ignore')
+        self.input_av_container: InputContainer = av.open(media_container.path, 'r')
 
         self.demux_iter = self.input_av_container.demux(self.in_stream)
         self.demux_saved_packet = None
@@ -181,9 +180,8 @@ class VideoCutter:
         # Normalize codec tags for container compatibility (must be done after bitstream filter setup)
         _normalize_output_codec_tag(self.out_stream, output_av_container, self.in_stream)
 
-        # Assert out_stream time_base is not None once at initialization
-        assert self.out_stream.time_base is not None, "Output stream must have a time_base"
-        self.out_time_base: Fraction = self.out_stream.time_base
+        assert self.out_stream.time_base, "Output stream must have a time_base"
+        self.out_time_base = Fraction(self.out_stream.time_base)
 
         # Track typical frame duration for fixing missing/zero durations
         # MP4 muxer uses duration to calculate edit list boundaries, so
@@ -337,7 +335,7 @@ class VideoCutter:
         muxing_codec = self.out_stream.codec_context
         enc_codec = cast(VideoCodecContext, CodecContext.create(self.codec_name, 'w'))
 
-        if muxing_codec.rate is not None:
+        if muxing_codec.rate:
             enc_codec.rate = muxing_codec.rate
         enc_codec.options.update(self.encoding_options)
 
@@ -345,10 +343,10 @@ class VideoCutter:
         enc_codec.height = muxing_codec.height
         enc_codec.pix_fmt = muxing_codec.pix_fmt
 
-        if muxing_codec.sample_aspect_ratio is not None:
+        if muxing_codec.sample_aspect_ratio:
             enc_codec.sample_aspect_ratio = muxing_codec.sample_aspect_ratio
         if self.codec_name == 'mpeg2video':
-            enc_codec.time_base = Fraction(1, muxing_codec.rate)
+            enc_codec.time_base = 1 / Fraction(muxing_codec.rate)
         else:
             enc_codec.time_base = self.out_time_base
 
@@ -414,7 +412,7 @@ class VideoCutter:
 
         for frame in self.fetch_frame(s.gop_start_dts, s.gop_end_dts, s.end_time, decoder_priming_dts):
             assert frame.pts is not None, "Frame pts should not be None after decoding"
-            in_tb = frame.time_base if frame.time_base is not None else self.in_time_base
+            in_tb = frame.time_base or self.in_time_base
             if frame.pts * in_tb < s.start_time:
                 continue
             if frame.pts * in_tb >= s.end_time:
@@ -530,7 +528,7 @@ class VideoCutter:
         leading_frames = [
             f for f in all_frames
             if f.pts is not None
-            and f.pts * (f.time_base if f.time_base is not None else self.in_time_base) >= gop_start_time
+            and f.pts * (f.time_base or self.in_time_base) >= gop_start_time
             and f.pts < cra_pts
         ]
         leading_frames.sort(key=lambda f: f.pts if f.pts is not None else 0)
@@ -581,7 +579,7 @@ class VideoCutter:
 
         if self.codec_name == 'mpeg2video':
             for p in result_packets:
-                if p.time_base is not None:
+                if p.time_base:
                     if p.pts is not None:
                         p.pts = int(p.pts * p.time_base / self.out_time_base)
                     if p.dts is not None:
@@ -703,7 +701,7 @@ class VideoCutter:
                 lowest_heap_item = self.frame_buffer[0]  # Peek at heap minimum
                 frame = lowest_heap_item.frame
                 frame_pts = lowest_heap_item.pts if lowest_heap_item.pts is not None else -1
-                frame_time_base = frame.time_base if frame.time_base is not None else self.in_time_base
+                frame_time_base = frame.time_base or self.in_time_base
 
                 # Only process frames that are safe to release (frame_pts <= current_dts)
                 if frame_pts <= current_dts:
@@ -729,7 +727,7 @@ class VideoCutter:
             # Peek at the next frame without popping it
             next_frame = self.frame_buffer[0]
             frame = next_frame.frame
-            frame_time_base = frame.time_base if frame.time_base is not None else self.in_time_base
+            frame_time_base = frame.time_base or self.in_time_base
 
             if (next_frame.pts is not None and
                 next_frame.pts * frame_time_base < end_time):
