@@ -2,24 +2,14 @@ from fractions import Fraction
 from typing import Protocol
 
 import av
-from av.packet import Packet
 
 from smartcut.media_container import MediaContainer
-from smartcut.track_cutters import (
-    PassthruAudioCutter,
-    SubtitleCutter,
-    create_audio_output_stream,
-    create_subtitle_output_stream,
-)
+from smartcut.track_cutters import PassthroughCutter, create_output_stream
 from smartcut.video_cutter import CutSegment, VideoCutter, create_video_output_stream
+
 
 class Progress(Protocol):
     def emit(self, completed: int, total: int) -> None: ...
-
-
-class PacketGenerator(Protocol):
-    def segment(self, cut_segment: CutSegment) -> list[Packet]: ...
-    def finish(self) -> list[Packet]: ...
 
 
 def adjust_range(
@@ -30,56 +20,9 @@ def adjust_range(
     epsilon = Fraction(1, 1_000_000)
     if start <= epsilon:
         start = Fraction(-10)
-    if end >= media_container.duration - epsilon:
+    if media_container.duration is not None and end >= media_container.duration - epsilon:
         end = media_container.duration + 10
     return start + media_container.start_time, end + media_container.start_time
-
-
-def make_cut_segments(
-    media_container: MediaContainer,
-    selection: tuple[Fraction, Fraction],
-) -> list[CutSegment]:
-    start, end = selection
-
-    if media_container.video_stream is None:
-        if not media_container.audio_tracks:
-            raise ValueError("input has no audio or video streams")
-        track = media_container.audio_tracks[0]
-        time_base = Fraction(track.av_stream.time_base)
-        start = max(start, Fraction(track.frame_times_pts[0]) * time_base)
-        end = min(end, Fraction(track.frame_times_pts[-1]) * time_base + Fraction(1, 10_000))
-        return [CutSegment(False, start, end)]
-
-    gop_starts = [
-        *media_container.gop_start_times_pts_s,
-        media_container.start_time + media_container.duration + Fraction(1, 10_000),
-    ]
-    segments = []
-    for index, (gop_start, gop_end, start_dts, end_dts) in enumerate(
-        zip(
-            gop_starts[:-1],
-            gop_starts[1:],
-            media_container.gop_start_times_dts,
-            media_container.gop_end_times_dts,
-        )
-    ):
-        overlap_start = max(gop_start, start)
-        overlap_end = min(gop_end, end)
-        if overlap_start >= overlap_end:
-            continue
-
-        complete_gop = gop_start >= start and gop_end <= end
-        segments.append(
-            CutSegment(
-                not complete_gop,
-                overlap_start,
-                overlap_end,
-                start_dts,
-                end_dts,
-                index,
-            )
-        )
-    return segments
 
 
 def smart_cut(
@@ -89,46 +32,102 @@ def smart_cut(
     quality: str,
     progress: Progress,
 ) -> None:
-    cut_segments = make_cut_segments(
-        media_container,
-        adjust_range(selection, media_container),
-    )
-    if not cut_segments:
-        raise ValueError("selected range contains no media")
-
-    with av.open(output_path, "w") as output:
-        output.metadata["ENCODED_BY"] = "mpv-smartcut 0.1.0"
-
-        container_name = (output.format.name or "").lower()
-        if any(name in container_name for name in ("matroska", "webm")):
+    start, end = adjust_range(selection, media_container)
+    total = max(1, int((selection[1] - selection[0]) * 1_000_000))
+    with av.open(output_path, 'w') as output:
+        output.metadata['ENCODED_BY'] = 'mpv-smartcut 0.1.0'
+        container_name = (output.format.name or '').lower()
+        if any(name in container_name for name in ('matroska', 'webm')):
             for stream in media_container.av_container.streams:
-                if stream.type == "attachment":
+                if stream.type == 'attachment':
                     output.add_stream_from_template(stream)
 
-        generators: list[PacketGenerator] = []
+        video_cutter = None
         if media_container.video_stream is not None:
-            stream_setup = create_video_output_stream(media_container, output)
-            generators.append(VideoCutter(media_container, stream_setup, output, quality))
-
-        for track_index in range(len(media_container.audio_tracks)):
-            audio_stream = create_audio_output_stream(media_container, output, track_index)
-            generators.append(PassthruAudioCutter(media_container, audio_stream, track_index))
-
-        for track_index in range(len(media_container.subtitle_tracks)):
-            subtitle_stream = create_subtitle_output_stream(media_container, output, track_index)
-            generators.append(SubtitleCutter(media_container, subtitle_stream, track_index))
-
+            video_stream = create_video_output_stream(media_container, output)
+            video_cutter = VideoCutter(media_container, video_stream, output, quality)
+        streams = {
+            stream.index: create_output_stream(output, stream)
+            for stream in media_container.passthrough_streams
+        }
         output.start_encoding()
-        total = len(cut_segments)
         progress.emit(0, total)
-        for completed, segment in enumerate(cut_segments, 1):
-            for generator in generators:
-                for packet in generator.segment(segment):
-                    if packet.dts is not None and packet.dts < -900_000:
-                        packet.dts = None
-                    output.mux(packet)
-            progress.emit(completed, total)
+        cutters = {}
+        found_media = False
 
-        for generator in generators:
-            for packet in generator.finish():
+        if video_cutter is not None:
+            for gop, gop_end in media_container.gops(end):
+                video_cutter.prepare_gop(gop)
+                overlap_start, overlap_end = max(start, gop.start_time), min(end, gop_end)
+                if overlap_start >= overlap_end:
+                    # Discard audio/subtitles from decoder priming before the selection.
+                    list(media_container.take_passthrough_packets(gop_end))
+                    continue
+                if not found_media:
+                    cutters = {
+                        stream.index: PassthroughCutter(stream, streams[stream.index], overlap_start, end, offset=overlap_start)
+                        for stream in media_container.passthrough_streams
+                    }
+                found_media = True
+                segment = CutSegment(
+                    gop.start_time < start or gop_end > end,
+                    overlap_start,
+                    overlap_end,
+                    gop.start_dts,
+                    gop.end_dts,
+                    gop.index,
+                )
+                for packet in video_cutter.segment(segment):
+                    output.mux(packet)
+                for packet in media_container.take_passthrough_packets(overlap_end):
+                    cut_packet = cutters[packet.stream_index].packet(packet)
+                    if cut_packet is not None:
+                        output.mux(cut_packet)
+                completed = int((overlap_end - selection[0] - media_container.start_time) * 1_000_000)
+                progress.emit(max(0, min(total, completed)), total)
+                if overlap_end >= end:
+                    break
+            for packet in video_cutter.finish():
                 output.mux(packet)
+        else:
+            audio_streams = [s for s in media_container.passthrough_streams if s.type == 'audio']
+            if not audio_streams:
+                raise ValueError('input has no audio or video streams')
+            audio_ends = {
+                s.index: ((s.start_time or 0) + s.duration) * s.time_base
+                for s in audio_streams if s.duration is not None
+            }
+            pending_audio = {
+                s.index for s in audio_streams
+                if (s.start_time is None or s.start_time * s.time_base < end)
+                and (s.index not in audio_ends or audio_ends[s.index] > start)
+            }
+            offset = max(start, media_container.start_time)
+            cutters = {
+                stream.index: PassthroughCutter(stream, streams[stream.index], start, end, offset=offset)
+                for stream in media_container.passthrough_streams
+            }
+            for packet in media_container.av_container.demux(media_container.streams):
+                if not pending_audio:
+                    break
+                if packet.pts is None:
+                    continue
+                timestamp = packet.pts * packet.time_base
+                if packet.stream.type == 'audio':
+                    track_end = audio_ends.get(packet.stream_index)
+                    if timestamp >= end or (
+                        track_end is not None
+                        and (packet.pts + (packet.duration or 0)) * packet.time_base >= track_end
+                    ):
+                        pending_audio.discard(packet.stream_index)
+                if timestamp >= end:
+                    continue
+                cut_packet = cutters[packet.stream_index].packet(packet)
+                if cut_packet is not None:
+                    output.mux(cut_packet)
+                    found_media = True
+                completed = int((timestamp - selection[0] - media_container.start_time) * 1_000_000)
+                progress.emit(max(0, min(total, completed)), total)
+        if not found_media:
+            raise ValueError('selected range contains no media')
+        progress.emit(total, total)

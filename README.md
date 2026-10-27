@@ -2,7 +2,7 @@
 
 `mpv-smartcut` is a small mpv frontend and maintained packaging fork of
 [skeskinen/smartcut](https://github.com/skeskinen/smartcut). It makes
-frame-accurate cuts while re-encoding only the GOPs around each cut point.
+frame-accurate cuts using stream copying and near-lossless boundary encoding.
 
 The frontend and backend ship together but remain separate processes:
 
@@ -11,9 +11,9 @@ The frontend and backend ship together but remain separate processes:
 - `mpv-smartcut-backend` is the minimal codec-aware worker invoked by the
   frontend.
 
-The fork preserves the original MIT license and codec implementation. Its first
-runtime change replaces NumPy timestamp indexing with Python standard-library
-lists and binary search, avoiding a large numerical-computing closure.
+The fork preserves the original MIT license. It streams the selected media in
+one pass and buffers neighboring GOPs for frame-accurate boundaries, without
+scanning the whole file or loading its audio into memory first.
 
 ## mpv usage
 
@@ -38,8 +38,12 @@ VP9, and AV1 use fast software encoder settings for these boundaries, trading
 larger boundary GOPs for speed. HEVC and AV1 boundaries with 4:2:0 video use
 NVENC when an NVIDIA GPU supports it, which is about 10 to 20 times faster than
 software at equal quality.
-Complete GOPs are copied unchanged. Encoding speed still depends on the codec,
-resolution, and distance to the nearest keyframes.
+Codec threading is bounded, and decoded frames are consumed directly to limit
+memory use during playback.
+Independent complete GOPs are copied unchanged. H.264 open GOPs may require
+re-encoding until the next independent keyframe. Encoding speed still depends
+on the codec, resolution, and distance to the nearest keyframes.
+Audio-only files with unknown track durations may need to be read to EOF.
 Older MPEG encoders use quantizer-based quality. `lossless` requires a codec
 that supports it, otherwise the highest available quality is used.
 

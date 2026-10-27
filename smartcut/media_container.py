@@ -1,230 +1,178 @@
-from dataclasses import dataclass, field
+from collections.abc import Iterator
+from dataclasses import dataclass
 from fractions import Fraction
-from typing import cast
+from math import ceil
+from os import cpu_count
 
-from av import AudioStream, Packet, VideoStream
+from av import Packet, VideoStream
 from av import open as av_open
 from av import time_base as AV_TIME_BASE
-from av.container.input import InputContainer
-from av.stream import Stream
 
 from smartcut.nal_tools import (
     get_h264_nal_unit_type,
     get_h265_nal_unit_type,
     is_leading_picture_nal_type,
     is_rasl_nal_type,
-    is_safe_h264_keyframe_nal,
     is_safe_h265_keyframe_nal,
 )
 
+
+# Leave memory and CPU headroom for mpv and other desktop applications.
+CODEC_THREADS = min(4, cpu_count() or 1)
+
+
 @dataclass
-class AudioTrack:
-    av_stream: AudioStream
-    packets: list[Packet] = field(default_factory=list)
-    frame_times_pts: list[int] = field(default_factory=list)
+class VideoGop:
+    index: int
+    packets: list[Packet]
+    start_time: Fraction
+    start_dts: int
+    end_dts: int
+    leading_end_dts: int | None
+    needs_priming: bool
+    is_idr: bool
+
 
 class MediaContainer:
-    av_container: InputContainer
-    video_stream: VideoStream | None
-    path: str
+    def __init__(self, path: str, selection: tuple[Fraction, Fraction]) -> None:
+        self.av_container = container = av_open(path, 'r')
+        self.start_time = Fraction(container.start_time, AV_TIME_BASE) if container.start_time is not None else Fraction(0)
+        self.duration = Fraction(container.duration, AV_TIME_BASE) if container.duration is not None else None
+        self.video_stream: VideoStream | None = container.streams.video[0] if container.streams.video else None
+        self.passthrough_streams = [
+            stream for stream in container.streams
+            if stream.type in ('audio', 'subtitle') and stream.time_base
+        ]
+        self.passthrough_packets: list[Packet] = []
+        self.streams = [*self.passthrough_streams]
+        if self.video_stream is not None:
+            self.video_stream.thread_type = 'SLICE'
+            self.video_stream.codec_context.thread_count = CODEC_THREADS
+            self.streams.insert(0, self.video_stream)
 
-    gop_start_times_pts_s: list[Fraction] # Smallest pts in a GOP, in seconds
+        start = selection[0] + self.start_time
+        if start > self.start_time:
+            if self.video_stream is not None:
+                # Include the previous GOP for open-GOP decoding references.
+                keyframe = self._seek_keyframe(int(start / self.video_stream.time_base))
+                if keyframe is not None:
+                    self._seek_keyframe(keyframe - 1)
+            else:
+                container.seek(int(start * AV_TIME_BASE))
 
-    gop_start_times_dts: list[int]
-    gop_end_times_dts: list[int]
-    gop_leading_end_dts: list[int | None]  # DTS of first non-leading picture in GOP (None if no leading pics)
-    gop_has_rasl: list[bool]  # True if GOP has RASL frames (need priming/hybrid recode)
+    def _seek_keyframe(self, timestamp: int) -> int | None:
+        """Seek before the keyframe at or preceding timestamp and return its timestamp.
 
-    audio_tracks: list[AudioTrack]
-    subtitle_tracks: list
+        Formats without a keyframe index, such as MPEG-TS, can land anywhere.
+        """
+        video = self.video_stream
+        assert video is not None and video.time_base
+        step = ceil(1 / video.time_base)
+        target = timestamp
+        while True:
+            self.av_container.seek(target, stream=video)
+            keyframe = next((
+                min(packet.pts, packet.dts) if packet.dts is not None else packet.pts
+                for packet in self.av_container.demux(video)
+                if packet.is_keyframe and packet.pts is not None
+            ), None)
+            if keyframe is None or keyframe <= timestamp or target <= (video.start_time or 0):
+                self.av_container.seek(target, stream=video)
+                return keyframe
+            target -= step
+            step *= 2
 
-    duration: Fraction
-    start_time: Fraction
+    def _gop_boundary(self, packet: Packet) -> bool:
+        if not packet.is_keyframe:
+            return False
+        assert self.video_stream is not None
+        codec = self.video_stream.codec_context.name
+        if codec == 'hevc':
+            return is_safe_h265_keyframe_nal(get_h265_nal_unit_type(bytes(packet)))
+        return True
 
-    def __init__(self, path: str) -> None:
-        self.path = path
+    def _gop(self, index: int, packets: list[Packet]) -> VideoGop:
+        first, last = packets[0], packets[-1]
+        assert first.time_base is not None and last.pts is not None
+        leading_end_dts = None
+        needs_priming = False
+        is_idr = False
+        assert self.video_stream is not None
+        codec = self.video_stream.codec_context.name
+        if codec == 'h264':
+            is_idr = get_h264_nal_unit_type(bytes(first)) == 5
+            needs_priming = not is_idr
+        elif codec == 'hevc':
+            nal_type = get_h265_nal_unit_type(bytes(first))
+            is_idr = nal_type in (19, 20)
+            if nal_type == 21:
+                has_leading = False
+                for packet in packets[1:]:
+                    nal_type = get_h265_nal_unit_type(bytes(packet))
+                    if not is_leading_picture_nal_type(nal_type):
+                        if has_leading:
+                            leading_end_dts = packet.dts
+                        break
+                    has_leading = True
+                    needs_priming |= is_rasl_nal_type(nal_type)
+        return VideoGop(
+            index,
+            packets,
+            min(packet.pts for packet in packets) * Fraction(first.time_base),
+            first.dts if first.dts is not None else -100_000_000,
+            last.dts if last.dts is not None else last.pts,
+            leading_end_dts,
+            needs_priming,
+            is_idr,
+        )
 
-        frame_pts = []
-        video_keyframe_indices = []
-
-        self.av_container = av_container = av_open(path, 'r')
-
-        self.start_time = Fraction(av_container.start_time, AV_TIME_BASE) if av_container.start_time is not None else Fraction(0)
-        manual_duration_calc = av_container.duration is None
-        self.duration = Fraction(av_container.duration , AV_TIME_BASE) if av_container.duration is not None else Fraction(0)
-
-        is_h264 = False
-        is_h265 = False
-
-        streams: list[Stream]
-
-        if len(av_container.streams.video) == 0:
-            self.video_stream = None
-            streams = [*av_container.streams.audio]
-        else:
-            self.video_stream = av_container.streams.video[0]
-            self.video_stream.thread_type = "FRAME"
-            streams = [self.video_stream, *av_container.streams.audio]
-
-            if self.video_stream.codec_context.name == 'hevc':
-                is_h265 = True
-            if self.video_stream.codec_context.name == 'h264':
-                is_h264 = True
-
-        self.audio_tracks = []
-        stream_index_to_audio_track = {}
-        for audio_stream in av_container.streams.audio:
-            if not audio_stream.time_base:
-                continue
-            audio_stream.codec_context.thread_type = "FRAME"
-            track = AudioTrack(audio_stream)
-            self.audio_tracks.append(track)
-            stream_index_to_audio_track[audio_stream.index] = track
-
-        self.subtitle_tracks = []
-        stream_index_to_subtitle_track = {}
-        for i, s in enumerate(av_container.streams.subtitles):
-            streams.append(s)
-            stream_index_to_subtitle_track[s.index] = i
-            self.subtitle_tracks.append([])
-
-        first_keyframe = True  # Always allow the first keyframe regardless of NAL type
-
-        # Track max packet end PTS per stream (integer domain) for manual duration calc
-        # Converting to Fraction once at end is much faster than per-packet Fraction math
-        max_end_pts_by_stream: dict[int, int] = {}
-
-        self.gop_start_times_dts = []
-        self.gop_end_times_dts = []
-        self.gop_leading_end_dts = []
-        self.gop_has_rasl = []
-        last_seen_video_dts = None
-        # Track leading pictures in current CRA GOP
-        tracking_leading_in_cra = False
-        current_gop_has_leading = False
-        current_gop_has_rasl = False
-
-        for packet in av_container.demux(streams):
+    def gops(self, end_time: Fraction) -> Iterator[tuple[VideoGop, Fraction]]:
+        pending = None
+        packets: list[Packet] = []
+        index = 0
+        for packet in self.av_container.demux(self.streams):
             if packet.pts is None:
                 continue
+            if packet.stream.type != 'video':
+                self.passthrough_packets.append(packet)
+                continue
+            if not packets and not self._gop_boundary(packet):
+                # Unindexed seeks can land after a keyframe.
+                continue
+            if packets and self._gop_boundary(packet):
+                gop = self._gop(index, packets)
+                index += 1
+                if pending is not None:
+                    yield pending, gop.start_time
+                    if gop.start_time >= end_time:
+                        return
+                pending = gop
+                packets = []
+            packets.append(packet)
 
-            if manual_duration_calc and (packet.pts is not None and packet.duration is not None):
-                stream_idx = packet.stream_index
-                end_pts = packet.pts + packet.duration
-                if stream_idx not in max_end_pts_by_stream or end_pts > max_end_pts_by_stream[stream_idx]:
-                    max_end_pts_by_stream[stream_idx] = end_pts
-            if packet.stream.type == 'video' and self.video_stream:
+        if packets:
+            gop = self._gop(index, packets)
+            if pending is not None:
+                yield pending, gop.start_time
+                if gop.start_time >= end_time:
+                    return
+            if self.duration is not None:
+                end = self.start_time + self.duration + Fraction(1, 10_000)
+            else:
+                end = max((p.pts + (p.duration or 1)) * p.time_base for p in packets)
+            yield gop, end
 
-                if packet.is_keyframe:
-                    nal_type = None
-                    if is_h265:
-                        nal_type = get_h265_nal_unit_type(bytes(packet))
-                    elif is_h264:
-                        nal_type = get_h264_nal_unit_type(bytes(packet))
-
-                    # Always allow the first keyframe regardless of NAL type (may be SEI, parameter sets, etc.)
-                    is_safe_keyframe = True
-                    if first_keyframe:
-                        first_keyframe = False  # Only apply to the very first keyframe
-                    # Use centralized helper functions for NAL type safety checks
-                    elif is_h265:
-                        is_safe_keyframe = is_safe_h265_keyframe_nal(nal_type)
-                    elif is_h264:
-                        is_safe_keyframe = is_safe_h264_keyframe_nal(nal_type)
-                    if is_safe_keyframe:
-                        # Finalize previous GOP's leading picture tracking
-                        if tracking_leading_in_cra:
-                            # Previous GOP was CRA but we never found non-leading picture
-                            # This means all frames after CRA were leading (unusual but possible)
-                            self.gop_leading_end_dts.append(None if not current_gop_has_leading else last_seen_video_dts)
-                            self.gop_has_rasl.append(current_gop_has_rasl)
-
-                        video_keyframe_indices.append(len(frame_pts))
-                        dts = packet.dts if packet.dts is not None else -100_000_000
-                        self.gop_start_times_dts.append(dts)
-
-                        if last_seen_video_dts is not None:
-                            self.gop_end_times_dts.append(last_seen_video_dts)
-
-                        # Start tracking leading pictures if this is a CRA GOP
-                        if is_h265 and nal_type == 21:  # CRA frame
-                            tracking_leading_in_cra = True
-                            current_gop_has_leading = False
-                            current_gop_has_rasl = False
-                        else:
-                            # Not a CRA, no leading pictures to track
-                            tracking_leading_in_cra = False
-                            current_gop_has_leading = False
-                            current_gop_has_rasl = False
-                            self.gop_leading_end_dts.append(None)
-                            self.gop_has_rasl.append(False)
-
-                elif tracking_leading_in_cra and is_h265:
-                    # Check if this non-keyframe packet is a leading picture
-                    packet_nal_type = get_h265_nal_unit_type(bytes(packet))
-                    if is_leading_picture_nal_type(packet_nal_type):
-                        current_gop_has_leading = True
-                        if is_rasl_nal_type(packet_nal_type):
-                            current_gop_has_rasl = True
-                    else:
-                        # Found first non-leading picture
-                        if current_gop_has_leading:
-                            # Record boundary only if there were actual leading pictures
-                            dts = packet.dts if packet.dts is not None else -100_000_000
-                            self.gop_leading_end_dts.append(dts)
-                        else:
-                            # No leading pictures in this CRA GOP
-                            self.gop_leading_end_dts.append(None)
-                        self.gop_has_rasl.append(current_gop_has_rasl)
-                        tracking_leading_in_cra = False
-
-                # Use PTS as fallback when DTS is None (common in exported segments)
-                last_seen_video_dts = packet.dts if packet.dts is not None else packet.pts
-                frame_pts.append(packet.pts)
-            elif packet.stream.type == 'audio':
-                track = stream_index_to_audio_track[packet.stream_index]
-                # NOTE: storing the audio packets like this keeps the whole compressed audio loaded in RAM
-                track.packets.append(packet)
-            elif packet.stream.type == 'subtitle':
-                self.subtitle_tracks[stream_index_to_subtitle_track[packet.stream_index]].append(packet)
-
-        # Finalize manual duration calculation - convert from PTS to Fraction once
-        if manual_duration_calc and max_end_pts_by_stream:
-            for stream_idx, max_pts in max_end_pts_by_stream.items():
-                stream = av_container.streams[stream_idx]
-                if not stream.time_base:
-                    continue
-                stream_duration = max_pts * Fraction(stream.time_base)
-                if stream_duration > self.duration:
-                    self.duration = stream_duration
-
-        if self.video_stream is not None:
-            # Finalize last GOP's leading picture tracking if still active
-            if tracking_leading_in_cra:
-                self.gop_leading_end_dts.append(None if not current_gop_has_leading else last_seen_video_dts)
-                self.gop_has_rasl.append(current_gop_has_rasl)
-            # Ensure gop_end_times_dts has the same length as gop_start_times_dts.
-            # This is needed because make_cut_segments uses zip() which truncates to
-            # shortest length. When all packets have dts=None (can happen in short
-            # exported segments), last_seen_video_dts stays None, so we use the
-            # same sentinel value used for gop_start_times_dts when DTS is missing.
-            if len(self.gop_end_times_dts) < len(self.gop_start_times_dts):
-                fallback_dts = last_seen_video_dts if last_seen_video_dts is not None else -100_000_000
-                self.gop_end_times_dts.append(fallback_dts)
-            assert len(self.gop_start_times_dts) == len(self.gop_end_times_dts), \
-                f"GOP DTS array length mismatch: start={len(self.gop_start_times_dts)}, end={len(self.gop_end_times_dts)}"
-            video_frame_times_pts = sorted(frame_pts)
-
-        # Collect integer PTS arrays for audio tracks.
-        for t in self.audio_tracks:
-            t.frame_times_pts = [cast(int, packet.pts) for packet in t.packets]
-
-        if self.video_stream is not None and self.video_stream.time_base:
-            video_time_base = Fraction(self.video_stream.time_base)
-            self.gop_start_times_pts_s = [
-                Fraction(video_frame_times_pts[index]) * video_time_base
-                for index in video_keyframe_indices
-            ]
+    def take_passthrough_packets(self, end_time: Fraction) -> Iterator[Packet]:
+        end_pts = {
+            stream.index: ceil(end_time / stream.time_base)
+            for stream in self.passthrough_streams
+        }
+        packets, self.passthrough_packets = self.passthrough_packets, []
+        for packet in packets:
+            if packet.pts < end_pts[packet.stream_index]:
+                yield packet
+            else:
+                self.passthrough_packets.append(packet)
 
     def close(self) -> None:
         self.av_container.close()

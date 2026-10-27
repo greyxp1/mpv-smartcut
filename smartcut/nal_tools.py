@@ -103,22 +103,6 @@ def get_h265_nal_unit_type(packet_data: bytes) -> int | None:
     return None
 
 
-def is_safe_h264_keyframe_nal(nal_type: int | None) -> bool:
-    """
-    Check if an H.264 NAL type represents a safe keyframe for cutting.
-
-    Args:
-        nal_type: H.264 NAL unit type (int)
-
-    Returns:
-        bool: True if this NAL type is safe for cutting
-    """
-    if nal_type is None:
-        return True # Can't know for sure
-    # Accept IDR frames (5), SEI (6), and parameter sets (7,8) as cutting points
-    return nal_type in [5, 6, 7, 8]
-
-
 def is_safe_h265_keyframe_nal(nal_type: int | None) -> bool:
     """
     Check if an H.265 NAL type represents a safe keyframe for cutting.

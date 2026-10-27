@@ -1,20 +1,19 @@
-import heapq
 from collections.abc import Generator
 from dataclasses import dataclass
 from fractions import Fraction
+from itertools import chain
 from typing import cast
 
 import av
 import av.bitstream
 from av import VideoCodecContext, VideoStream
 from av.codec.context import CodecContext
-from av.container.input import InputContainer
 from av.container.output import OutputContainer
 from av.packet import Packet
 from av.stream import Disposition
 from av.video.frame import PictureType, VideoFrame
 
-from smartcut.media_container import MediaContainer
+from smartcut.media_container import CODEC_THREADS, MediaContainer, VideoGop
 from smartcut.nal_tools import get_h265_nal_unit_type, is_leading_picture_nal_type
 
 
@@ -40,18 +39,6 @@ CRF_BY_QUALITY = {
 }
 
 
-@dataclass
-class FrameHeapItem:
-    """Wrapper for frames in the heap, sorted by PTS"""
-    pts: int | None
-    frame: VideoFrame
-
-    def __lt__(self, other: 'FrameHeapItem') -> bool:
-        # Handle None PTS values by treating them as -1 (earliest)
-        self_pts = self.pts if self.pts is not None else -1
-        other_pts = other.pts if other.pts is not None else -1
-        return self_pts < other_pts
-
 def is_annexb(packet: Packet | bytes | None) -> bool:
     if packet is None:
         return False
@@ -59,7 +46,7 @@ def is_annexb(packet: Packet | bytes | None) -> bool:
     return data[:3] == b'\0\0\x01' or data[:4] == b'\0\0\0\x01'
 
 def copy_packet(p: Packet) -> Packet:
-    packet = Packet(bytes(p))
+    packet = Packet(p)
     packet.pts = p.pts
     packet.dts = p.dts
     packet.duration = p.duration
@@ -121,7 +108,6 @@ class VideoCutter:
         output_av_container: OutputContainer,
         quality: str,
     ) -> None:
-        self.media_container = media_container
         self.encoder_inited = False
         self.quality = quality
 
@@ -131,15 +117,11 @@ class VideoCutter:
         assert self.in_stream.time_base, "Video stream must have a time_base"
         self.in_time_base = Fraction(self.in_stream.time_base)
 
-        # Open another container because seeking to beginning of the file is unreliable...
-        self.input_av_container: InputContainer = av.open(media_container.path, 'r')
-
-        self.demux_iter = self.input_av_container.demux(self.in_stream)
+        self.current_gop: VideoGop | None = None
+        self.previous_gop: VideoGop | None = None
+        self.demux_iter = iter(())
         self.demux_saved_packet = None
 
-        # Frame buffering for fetch_frame (using heap for efficient PTS ordering)
-        self.frame_buffer: list[FrameHeapItem] = []
-        self.frame_buffer_gop_dts = -1
         self.decoder = self.in_stream.codec_context
 
         self.out_stream = out_stream
@@ -170,8 +152,13 @@ class VideoCutter:
         # Track stream continuity for hybrid CRA recoding
         self.last_remuxed_segment_gop_index = None
         self.is_first_remuxed_segment = True
-        # Track decoder continuity between GOPs: last GOP end DTS consumed
-        self._last_fetch_end_dts: int | None = None
+
+    def prepare_gop(self, gop: VideoGop) -> None:
+        self.previous_gop = self.current_gop
+        self.current_gop = gop
+        previous_packets = self.previous_gop.packets if self.previous_gop is not None else ()
+        self.demux_iter = iter(chain(previous_packets, gop.packets))
+        self.demux_saved_packet = None
 
     def init_encoder(self) -> None:
         self.encoder_inited = True
@@ -210,6 +197,8 @@ class VideoCutter:
             self.encoding_options = {}
         if self.codec_name in ('h264', 'hevc'):
             self.encoding_options['preset'] = 'ultrafast'
+            if self.codec_name == 'hevc':
+                self.encoding_options['tune'] = 'zerolatency'
         elif self.codec_name in ('vp8', 'vp9'):
             self.encoding_options.update({
                 'deadline': 'good',
@@ -246,7 +235,10 @@ class VideoCutter:
         elif self.codec_name == 'hevc':
             # Source encoder settings can override both our speed preset and CRF.
             # Boundary GOPs only need inline headers to join the copied bitstream.
-            x265_params = ['repeat-headers=1', 'info=0', 'log-level=error']
+            x265_params = [
+                'repeat-headers=1', 'info=0', 'log-level=error',
+                f'pools={CODEC_THREADS}', 'frame-threads=1',
+            ]
 
             if self.quality == "lossless":
                 x265_params.append('lossless=1')
@@ -363,6 +355,7 @@ class VideoCutter:
         if muxing_codec.bit_rate_tolerance is not None:
             enc_codec.bit_rate_tolerance = muxing_codec.bit_rate_tolerance
         enc_codec.codec_tag = muxing_codec.codec_tag
+        enc_codec.thread_count = CODEC_THREADS
         enc_codec.thread_type = "FRAME"
         if nvenc_pix_fmt is not None:
             try:
@@ -375,7 +368,15 @@ class VideoCutter:
         self.enc_codec = enc_codec
 
     def segment(self, cut_segment: CutSegment) -> list[Packet]:
-        if cut_segment.require_recode:
+        assert self.current_gop is not None
+        # A non-IDR H.264 GOP can only follow the preceding original GOP.
+        # After recoding, keep recoding until a complete IDR GOP resets the sequence.
+        needs_h264_recode = (
+            self.codec_name == 'h264'
+            and not self.current_gop.is_idr
+            and self.last_remuxed_segment_gop_index != cut_segment.gop_index - 1
+        )
+        if cut_segment.require_recode or needs_h264_recode:
             packets = self.recode_segment(cut_segment)
         elif self._should_hybrid_recode_cra(cut_segment):
             # CRA GOP with leading pictures: recode leading pics, remux rest
@@ -403,8 +404,6 @@ class VideoCutter:
         for packet in packets:
             self._fix_packet_timestamps(packet)
 
-        self.input_av_container.close()
-
         return packets
 
     def recode_segment(self, s: CutSegment) -> list[Packet]:
@@ -415,15 +414,11 @@ class VideoCutter:
         self._ensure_enc_codec()
         assert self.enc_codec is not None
 
-        # Prime decoder from previous GOP if this GOP has RASL frames
-        # (RASL frames reference frames from before the CRA, so decoder needs previous GOP)
+        # Open-GOP pictures may reference frames before the current keyframe.
         decoder_priming_dts = None
-        if (
-            s.gop_index > 0
-            and s.gop_index < len(self.media_container.gop_has_rasl)
-            and self.media_container.gop_has_rasl[s.gop_index]
-        ):
-            decoder_priming_dts = self.media_container.gop_start_times_dts[s.gop_index - 1]
+        assert self.current_gop is not None
+        if self.previous_gop is not None and self.current_gop.needs_priming:
+            decoder_priming_dts = self.previous_gop.start_dts
 
         for frame in self.fetch_frame(s.gop_start_dts, s.gop_end_dts, s.end_time, decoder_priming_dts):
             assert frame.pts is not None, "Frame pts should not be None after decoding"
@@ -483,9 +478,8 @@ class VideoCutter:
         2. There's discontinuity before this point (content was skipped/cut)
         """
         # Check 1: GOP must have RASL frames
-        if s.gop_index < 0 or s.gop_index >= len(self.media_container.gop_has_rasl):
-            return False
-        if not self.media_container.gop_has_rasl[s.gop_index]:
+        assert self.current_gop is not None
+        if self.codec_name != 'hevc' or not self.current_gop.needs_priming:
             return False
 
         # Check 2: Must have discontinuity before this point
@@ -510,7 +504,8 @@ class VideoCutter:
         segment_start_offset = self.segment_start_in_output / self.out_time_base
 
         # Get leading boundary
-        leading_end_dts = self.media_container.gop_leading_end_dts[s.gop_index]
+        assert self.current_gop is not None
+        leading_end_dts = self.current_gop.leading_end_dts
         assert leading_end_dts is not None, "hybrid_recode_cra_segment called without leading pictures"
 
         self._ensure_enc_codec()
@@ -518,16 +513,17 @@ class VideoCutter:
 
         # Decoder priming for RASL reference frames
         decoder_priming_dts = None
-        if s.gop_index > 0:
-            decoder_priming_dts = self.media_container.gop_start_times_dts[s.gop_index - 1]
+        if self.previous_gop is not None:
+            decoder_priming_dts = self.previous_gop.start_dts
 
         # Decode leading + CRA frames, collect packets for later remux
         collected_packets: list[Packet] = []
         all_frames: list[VideoFrame] = []
+        gop_start_time = self.current_gop.start_time
 
         for frame in self.fetch_frame(s.gop_start_dts, leading_end_dts, s.end_time,
                                        decoder_priming_dts, collected_packets):
-            if frame.pts is not None:
+            if frame.pts is not None and frame.pts * (frame.time_base or self.in_time_base) >= gop_start_time:
                 all_frames.append(frame)
 
         # Get CRA PTS (collected_packets has only non-leading packets, i.e., just CRA)
@@ -535,15 +531,10 @@ class VideoCutter:
         cra_pts = collected_packets[0].pts
         assert cra_pts is not None, "CRA packet has no PTS"
 
-        # Get GOP start time to filter out priming frames from previous GOPs
-        gop_start_time = self.media_container.gop_start_times_pts_s[s.gop_index]
-
-        # Leading frames: PTS >= GOP start AND PTS < CRA PTS (will be encoded)
-        # Filter by GOP start to exclude priming frames from previous GOPs
+        # Leading frames precede CRA PTS. Priming frames were discarded while decoding.
         leading_frames = [
             f for f in all_frames
             if f.pts is not None
-            and f.pts * (f.time_base or self.in_time_base) >= gop_start_time
             and f.pts < cra_pts
         ]
         leading_frames.sort(key=lambda f: f.pts if f.pts is not None else 0)
@@ -630,7 +621,7 @@ class VideoCutter:
                 if saved_dts <= end_dts:
                     packet = self.demux_saved_packet
                     self.demux_saved_packet = None
-                    yield packet
+                    yield copy_packet(packet)
                 else:
                     # Saved packet is beyond our end range, don't yield it
                     return
@@ -643,12 +634,6 @@ class VideoCutter:
 
             # Skip packets before target_dts
             if packet.pts is None or in_dts < target_dts:
-                diff = (target_dts - in_dts) * self.in_time_base
-                if in_dts > 0 and diff > 120:
-                    t = int(target_dts - 30 / self.in_time_base)
-                    self.input_av_container.seek(t, stream = self.in_stream)
-                    # Clear saved packet after seek since iterator position changed
-                    self.demux_saved_packet = None
                 continue
 
             # Check if packet exceeds end_dts
@@ -658,44 +643,15 @@ class VideoCutter:
                 return
 
             # Packet is in our target range, yield it
-            yield packet
+            yield copy_packet(packet)
 
     def fetch_frame(self, gop_start_dts: int, gop_end_dts: int, end_time: Fraction, decoder_priming_dts: int | None = None, collect_packets: list[Packet] | None = None) -> Generator[VideoFrame, None, None]:
-        # Check if previous iteration consumed exactly to this GOP start
-        continuous = self._last_fetch_end_dts is not None and (self._last_fetch_end_dts in (gop_end_dts, gop_start_dts))
-        self._last_fetch_end_dts = gop_end_dts
+        start_dts = decoder_priming_dts if decoder_priming_dts is not None else gop_start_dts
+        self.decoder.flush_buffers()
 
-        # Choose actual start DTS. Allow priming from previous GOP unless we're either still in the same GOP or continuing to the next one.
-        start_dts = gop_start_dts if continuous else (decoder_priming_dts if decoder_priming_dts is not None else gop_start_dts)
-
-        # Initialize or reset for new GOP boundary unless continuous
-        if self.frame_buffer_gop_dts != gop_start_dts and not continuous:
-            self.frame_buffer = []
-            self.frame_buffer_gop_dts = gop_start_dts
-            self.decoder.flush_buffers()
-
-        # If asked to start earlier than GOP, seek and clear state (skip if continuous)
-        if start_dts < gop_start_dts and not continuous:
-            try:
-                self.decoder.flush_buffers()
-                self.frame_buffer = []
-                self.input_av_container.seek(start_dts, stream=self.in_stream)
-                self.demux_saved_packet = None
-              # Recreate demux iterator after an explicit seek to ensure position is honored
-                self.demux_iter = self.input_av_container.demux(self.in_stream)
-
-            except Exception:
-                pass
-
-        # Process packets and yield frames when safe
-        current_dts = gop_start_dts
-
-        for packet in self.fetch_packet(start_dts, gop_end_dts):
-            current_dts = packet.dts if packet.dts is not None else current_dts
-
-            # Collect packets for remuxing if requested (hybrid recode path)
-            # Skip: priming packets (dts < gop_start_dts), leading pictures (RASL/RADL)
-            if collect_packets is not None:
+        # The decoder reorders pictures. Yield them directly instead of retaining 15 full frames.
+        for packet in chain(self.fetch_packet(start_dts, gop_end_dts), (None,)):
+            if packet is not None and collect_packets is not None:
                 packet_dts = packet.dts if packet.dts is not None else packet.pts
                 should_collect = packet_dts is not None and packet_dts >= gop_start_dts
                 if should_collect and self.codec_name == 'hevc':
@@ -705,50 +661,13 @@ class VideoCutter:
                 if should_collect:
                     collect_packets.append(copy_packet(packet))
 
-            # Decode packet and add frames to buffer
-            for frame in self.decoder.decode(packet):
-                heap_item = FrameHeapItem(frame.pts, frame)
-                heapq.heappush(self.frame_buffer, heap_item)
-
-            # Release frames that are safe (buffer_lowest_pts <= current_dts)
-            BUFFERED_FRAMES_COUNT = 15 # We need this to be quite high, b/c GENPTS is on and we can't know if the pts values are real or fake
-            while len(self.frame_buffer) > BUFFERED_FRAMES_COUNT:
-                lowest_heap_item = self.frame_buffer[0]  # Peek at heap minimum
-                frame = lowest_heap_item.frame
-                frame_pts = lowest_heap_item.pts if lowest_heap_item.pts is not None else -1
-                frame_time_base = frame.time_base or self.in_time_base
-
-                # Only process frames that are safe to release (frame_pts <= current_dts)
-                if frame_pts <= current_dts:
-                    if frame_pts * frame_time_base < end_time:
-                        heapq.heappop(self.frame_buffer)  # Remove from heap
-                        yield frame
-                    else:
-                        # Safe frame is beyond end_time - we're done since all frames from now would be beyond end time
-                       return
-                else:
-                    break
-
-        # Final flush of the decoder
-        try:
-            for frame in self.decoder.decode(None):
-                heap_item = FrameHeapItem(frame.pts, frame)
-                heapq.heappush(self.frame_buffer, heap_item)
-        except Exception:
-            pass
-
-        # Yield remaining frames within time range
-        while self.frame_buffer:
-            # Peek at the next frame without popping it
-            next_frame = self.frame_buffer[0]
-            frame = next_frame.frame
-            frame_time_base = frame.time_base or self.in_time_base
-
-            if (next_frame.pts is not None and
-                next_frame.pts * frame_time_base < end_time):
-                # Frame is within time range, pop and yield it
-                heapq.heappop(self.frame_buffer)
+            try:
+                frames = self.decoder.decode(packet)
+            except av.error.EOFError:
+                if packet is not None:
+                    raise
+                return
+            for frame in frames:
+                if frame.pts is not None and frame.pts * (frame.time_base or self.in_time_base) >= end_time:
+                    return
                 yield frame
-            else:
-                # Frame is outside time range, stop processing (leave it in buffer)
-                break

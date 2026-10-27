@@ -25,11 +25,12 @@ class Progress:
 
 def main() -> None:
     input_path, output_path, start, end, progress_path, quality = sys.argv[1:]
-    source = MediaContainer(input_path)
+    selection = (Fraction(start), Fraction(end))
+    source = MediaContainer(input_path, selection)
     try:
         smart_cut(
             source,
-            (Fraction(start), Fraction(end)),
+            selection,
             output_path,
             quality,
             Progress(progress_path),
