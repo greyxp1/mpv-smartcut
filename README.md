@@ -33,6 +33,15 @@ quality=high
 
 `quality` controls only the small re-encoded boundary GOPs and accepts `low`,
 `normal`, `high`, `indistinguishable`, `near-lossless`, or `lossless`.
+The default, `high`, targets near-lossless boundary quality. H.264, HEVC, VP8,
+VP9, and AV1 use fast software encoder settings for these boundaries, trading
+larger boundary GOPs for speed. HEVC and AV1 boundaries with 4:2:0 video use
+NVENC when an NVIDIA GPU supports it, which is about 10 to 20 times faster than
+software at equal quality.
+Complete GOPs are copied unchanged. Encoding speed still depends on the codec,
+resolution, and distance to the nearest keyframes.
+Older MPEG encoders use quantizer-based quality. `lossless` requires a codec
+that supports it, otherwise the highest available quality is used.
 
 Cuts are written to a hidden partial file and renamed only after success.
 Partial output is deleted when processing fails, is cancelled, or mpv exits.

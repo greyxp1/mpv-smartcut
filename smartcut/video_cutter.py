@@ -28,11 +28,13 @@ class CutSegment:
     gop_index: int = -1
 
 
+NVENC_PIX_FMTS = {'yuv420p': 'yuv420p', 'nv12': 'nv12', 'yuv420p10le': 'p010le', 'p010le': 'p010le'}
+
 CRF_BY_QUALITY = {
     "low": 23,
     "normal": 18,
-    "high": 14,
-    "indistinguishable": 8,
+    "high": 3,
+    "indistinguishable": 3,
     "near-lossless": 3,
     "lossless": 0,
 }
@@ -70,44 +72,19 @@ def copy_packet(p: Packet) -> Packet:
     return packet
 
 
-@dataclass
-class VideoStreamSetup:
-    out_stream: VideoStream
-    codec_name: str
-
-
 def create_video_output_stream(
     media_container: MediaContainer,
     output_av_container: OutputContainer,
-) -> VideoStreamSetup:
+) -> VideoStream:
     in_stream = cast(VideoStream, media_container.video_stream)
     assert in_stream.time_base, "Video stream must have a time_base"
 
-    original_codec_name = in_stream.codec_context.name
-    codec_name = {
-        "libdav1d": "libaom-av1",
-    }.get(original_codec_name, original_codec_name)
-
-    if codec_name != original_codec_name:
-        out_stream = cast(VideoStream, output_av_container.add_stream(
-            codec_name,
-            rate=in_stream.guessed_rate,
-        ))
-        out_stream.width = in_stream.width
-        out_stream.height = in_stream.height
-        if in_stream.sample_aspect_ratio:
-            out_stream.sample_aspect_ratio = in_stream.sample_aspect_ratio
-    else:
-        out_stream = output_av_container.add_stream_from_template(
-            in_stream,
-            options={"x265-params": "log_level=error"},
-        )
-
+    out_stream = output_av_container.add_stream_from_template(in_stream, opaque=True)
     out_stream.metadata.update(in_stream.metadata)
     out_stream.disposition = cast(Disposition, in_stream.disposition.value)
     out_stream.time_base = in_stream.time_base
     assert out_stream.time_base, "Output stream must have a time_base"
-    return VideoStreamSetup(out_stream, codec_name)
+    return out_stream
 
 
 def _normalize_output_codec_tag(
@@ -140,7 +117,7 @@ class VideoCutter:
     def __init__(
         self,
         media_container: MediaContainer,
-        stream_setup: VideoStreamSetup,
+        out_stream: VideoStream,
         output_av_container: OutputContainer,
         quality: str,
     ) -> None:
@@ -165,9 +142,8 @@ class VideoCutter:
         self.frame_buffer_gop_dts = -1
         self.decoder = self.in_stream.codec_context
 
-        # Use pre-created output stream from stream_setup
-        self.out_stream = stream_setup.out_stream
-        self.codec_name = stream_setup.codec_name
+        self.out_stream = out_stream
+        self.codec_name = self.in_stream.codec_context.name
 
         self.remux_bitstream_filter = av.bitstream.BitStreamFilterContext('null', self.in_stream, self.out_stream)
         if self.in_stream.codec_context.name == 'h264' and not is_annexb(self.in_stream.codec_context.extradata):
@@ -208,8 +184,6 @@ class VideoCutter:
         if self.codec_name == 'vp9':
             if profile is not None:
                 profile = profile[-1:]
-                if int(profile) > 1:
-                    raise ValueError("VP9 profiles 2 and 3 are not supported")
         elif profile is not None:
             if 'Baseline' in profile:
                 profile = 'baseline'
@@ -227,8 +201,27 @@ class VideoCutter:
             crf_value += 4
         if self.quality == "lossless":
             crf_value = 0
+            if self.codec_name == 'h264':
+                # x264 selects High 4:4:4 Predictive for lossless, even with 4:2:0 input.
+                profile = None
 
         self.encoding_options = {'crf': str(crf_value)}
+        if self.codec_name in ('mpeg2video', 'mpeg4', 'msmpeg4v2', 'msmpeg4v3'):
+            self.encoding_options = {}
+        if self.codec_name in ('h264', 'hevc'):
+            self.encoding_options['preset'] = 'ultrafast'
+        elif self.codec_name in ('vp8', 'vp9'):
+            self.encoding_options.update({
+                'deadline': 'good',
+                'cpu-used': '4',
+                'lag-in-frames': '0',
+            })
+            if self.codec_name == 'vp9':
+                self.encoding_options['row-mt'] = '1'
+            else:
+                # VP8 requires a bitrate target. Bound quantization so that target
+                # cannot reduce boundary quality, and allow CRF below its default min.
+                self.encoding_options.update({'qmin': '0', 'qmax': str(crf_value)})
         if self.codec_name == 'av1':
             # Smart cutting only encodes boundary GOPs. Favor low-latency,
             # multithreaded libaom operation while quality remains controlled
@@ -251,39 +244,27 @@ class VideoCutter:
             self.encoding_options['x264-params'] = 'sps-id=3'
 
         elif self.codec_name == 'hevc':
-            # Preserve x265 parameters embedded in the input extradata when available.
-
-            assert self.in_stream is not None
-            assert self.in_stream.codec_context is not None
-            extradata = self.in_stream.codec_context.extradata
-            x265_params = []
-            try:
-                if extradata is None:
-                    raise ValueError("No extradata")
-                options_str = str(extradata.split(b'options: ')[1][:-1], 'ascii')
-                x265_params = options_str.split(' ')
-                for i, o in enumerate(x265_params):
-                    if ':' in o:
-                        x265_params[i] = o.replace(':', ',')
-                    if '=' not in o:
-                        x265_params[i] = o + '=1'
-            except Exception:
-                pass
-
-            # Repeat headers. This should be the same as `global_headers = False`,
-            # but for some reason setting this explicitly is necessary with x265.
-            x265_params.append('repeat-headers=1')
-
-            # Disable encoder info SEI. Since smartcut only re-encodes frames at cut points,
-            # having x265 write its encoding settings would be misleading - it doesn't
-            # represent the original video's settings.
-            x265_params.append('info=0')
+            # Source encoder settings can override both our speed preset and CRF.
+            # Boundary GOPs only need inline headers to join the copied bitstream.
+            x265_params = ['repeat-headers=1', 'info=0', 'log-level=error']
 
             if self.quality == "lossless":
                 x265_params.append('lossless=1')
 
             self.encoding_options['x265-params'] = ':'.join(x265_params)
 
+        # NVENC encodes 4K HEVC and AV1 boundaries about 10-20x faster than
+        # software at equal PSNR. AV1 uses a 0-255 quantizer scale.
+        self.nvenc_options: dict[str, str] | None = None
+        if self.codec_name in ('hevc', 'av1'):
+            self.nvenc_options = {'preset': 'p1', 'bf': '0'}
+            if self.quality != 'lossless':
+                qp = crf_value * 3 if self.codec_name == 'av1' else crf_value
+                self.nvenc_options.update({'rc': 'constqp', 'qp': str(qp)})
+            elif self.codec_name == 'hevc':
+                self.nvenc_options['tune'] = 'lossless'
+            else:
+                self.nvenc_options = None
 
     def _fix_packet_timestamps(self, packet: Packet) -> None:
         """Fix packet DTS/PTS to ensure monotonic increase and PTS >= DTS."""
@@ -333,15 +314,39 @@ class VideoCutter:
             return
 
         muxing_codec = self.out_stream.codec_context
-        enc_codec = cast(VideoCodecContext, CodecContext.create(self.codec_name, 'w'))
+        nvenc_pix_fmt = NVENC_PIX_FMTS.get(muxing_codec.pix_fmt) if self.nvenc_options is not None else None
+        if nvenc_pix_fmt is not None:
+            assert self.nvenc_options is not None
+            name, options, pix_fmt = f'{self.codec_name}_nvenc', self.nvenc_options, nvenc_pix_fmt
+        else:
+            name, options, pix_fmt = self.codec_name, self.encoding_options, muxing_codec.pix_fmt
+        enc_codec = cast(VideoCodecContext, CodecContext.create(name, 'w'))
 
-        if muxing_codec.rate:
-            enc_codec.rate = muxing_codec.rate
-        enc_codec.options.update(self.encoding_options)
+        rate = muxing_codec.rate or self.in_stream.guessed_rate
+        if rate:
+            enc_codec.rate = rate
+        enc_codec.options.update(options)
+        if self.codec_name in ('mpeg2video', 'mpeg4', 'msmpeg4v2', 'msmpeg4v3'):
+            # Native MPEG encoders use a quantizer instead of CRF.
+            quantizer = {
+                'low': 8,
+                'normal': 5,
+                'high': 1,
+                'indistinguishable': 1,
+                'near-lossless': 1,
+                'lossless': 1,
+            }[self.quality]
+            enc_codec.qscale = True
+            enc_codec.global_quality = quantizer * 118  # FF_QP2LAMBDA
 
         enc_codec.width = muxing_codec.width
         enc_codec.height = muxing_codec.height
-        enc_codec.pix_fmt = muxing_codec.pix_fmt
+        enc_codec.pix_fmt = pix_fmt
+        enc_codec.color_range = muxing_codec.color_range
+        enc_codec.colorspace = muxing_codec.colorspace
+        enc_codec.color_primaries = muxing_codec.color_primaries
+        enc_codec.color_trc = muxing_codec.color_trc
+        enc_codec.chroma_sample_location = muxing_codec.chroma_sample_location
 
         if muxing_codec.sample_aspect_ratio:
             enc_codec.sample_aspect_ratio = muxing_codec.sample_aspect_ratio
@@ -350,12 +355,22 @@ class VideoCutter:
         else:
             enc_codec.time_base = self.out_time_base
 
-        if muxing_codec.bit_rate is not None:
+        if self.codec_name in ('vp9', 'av1'):
+            # A bitrate target turns CRF into constrained quality for these encoders.
+            enc_codec.bit_rate = 0
+        elif self.codec_name not in ('h264', 'hevc') and muxing_codec.bit_rate is not None:
             enc_codec.bit_rate = muxing_codec.bit_rate
         if muxing_codec.bit_rate_tolerance is not None:
             enc_codec.bit_rate_tolerance = muxing_codec.bit_rate_tolerance
         enc_codec.codec_tag = muxing_codec.codec_tag
         enc_codec.thread_type = "FRAME"
+        if nvenc_pix_fmt is not None:
+            try:
+                enc_codec.open()
+            except av.FFmpegError:
+                # No usable NVIDIA GPU or driver; use the software encoder.
+                self.nvenc_options = None
+                return self._ensure_enc_codec()
         self.enc_last_pts = -1
         self.enc_codec = enc_codec
 
@@ -681,8 +696,8 @@ class VideoCutter:
             # Collect packets for remuxing if requested (hybrid recode path)
             # Skip: priming packets (dts < gop_start_dts), leading pictures (RASL/RADL)
             if collect_packets is not None:
-                packet_dts = packet.dts if packet.dts is not None else current_dts
-                should_collect = packet_dts >= gop_start_dts  # Skip priming packets
+                packet_dts = packet.dts if packet.dts is not None else packet.pts
+                should_collect = packet_dts is not None and packet_dts >= gop_start_dts
                 if should_collect and self.codec_name == 'hevc':
                     nal_type = get_h265_nal_unit_type(bytes(packet))
                     if is_leading_picture_nal_type(nal_type):
