@@ -1,5 +1,5 @@
 from fractions import Fraction
-from typing import Protocol
+from typing import BinaryIO, Protocol
 
 import av
 
@@ -28,7 +28,7 @@ def adjust_range(
 def smart_cut(
     media_container: MediaContainer,
     selection: tuple[Fraction, Fraction],
-    output_path: str,
+    output_path: str | BinaryIO,
     quality: str,
     progress: Progress,
 ) -> None:

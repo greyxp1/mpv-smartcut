@@ -15,7 +15,12 @@ python3Packages.buildPythonApplication {
   postInstall = ''
     install -Dm444 mpv-smartcut.lua \
       "$out/share/mpv/scripts/mpv-smartcut.lua"
+    substituteInPlace "$out/share/mpv/scripts/mpv-smartcut.lua" \
+      --replace-fail 'backend = "mpv-smartcut-backend"' \
+        "backend = \"$out/bin/mpv-smartcut-backend\""
   '';
+
+  passthru.scriptName = "mpv-smartcut.lua";
 
   nativeInstallCheckInputs = [lua5_4];
   doInstallCheck = true;

@@ -7,9 +7,12 @@ frame-accurate cuts using stream copying and near-lossless boundary encoding.
 The frontend and backend ship together but remain separate processes:
 
 - `mpv-smartcut.lua` owns selection, progress, cancellation, temporary files,
-  atomic finalization, and cleanup.
+  cleanup, and completion messages.
 - `mpv-smartcut-backend` is the minimal codec-aware worker invoked by the
-  frontend.
+  frontend and publishes completed cuts without overwriting existing files.
+
+The Nix package binds its installed script to the matching backend and can be
+used directly in mpv's script list.
 
 The fork preserves the original MIT license. It streams the selected media in
 one pass and buffers neighboring GOPs for frame-accurate boundaries, without
@@ -47,5 +50,7 @@ Audio-only files with unknown track durations may need to be read to EOF.
 Older MPEG encoders use quantizer-based quality. `lossless` requires a codec
 that supports it, otherwise the highest available quality is used.
 
-Cuts are written to a hidden partial file and renamed only after success.
+Cuts are written to a unique hidden partial file and published only after success.
 Partial output is deleted when processing fails, is cancelled, or mpv exits.
+If publication fails, including when the final filename becomes occupied, the
+completed partial file is kept and its path is shown.

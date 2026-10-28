@@ -24,19 +24,27 @@ class Progress:
 
 
 def main() -> None:
-    input_path, output_path, start, end, progress_path, quality = sys.argv[1:]
+    input_path, output_path, start, end, progress_path, quality, final_path = sys.argv[1:]
     selection = (Fraction(start), Fraction(end))
     source = MediaContainer(input_path, selection)
     try:
-        smart_cut(
-            source,
-            selection,
-            output_path,
-            quality,
-            Progress(progress_path),
-        )
+        with open(output_path, "xb") as output:
+            smart_cut(
+                source,
+                selection,
+                output,
+                quality,
+                Progress(progress_path),
+            )
     finally:
         source.close()
+
+    try:
+        os.link(output_path, final_path)
+        os.unlink(output_path)
+    except OSError as error:
+        print(f"Could not finalize cut: {error}. Completed cut kept at {output_path}", file=sys.stderr)
+        sys.exit(2)
 
 
 if __name__ == "__main__":

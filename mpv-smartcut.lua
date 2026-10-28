@@ -18,6 +18,7 @@ local shutting_down = false
 local temporary_output
 local final_output
 local progress_path
+local job_serial = 0
 local overlay = mp.create_osd_overlay("ass-events")
 
 local function format_time(seconds)
@@ -103,7 +104,8 @@ local function choose_output(input)
         local output = utils.join_path(directory, output_name)
         local partial = utils.join_path(
             directory,
-            "." .. opts.output_prefix .. stem .. suffix .. ".partial" .. extension
+            "." .. opts.output_prefix .. stem .. suffix .. ".partial." ..
+                utils.getpid() .. "." .. job_serial .. extension
         )
         if not utils.file_info(output) and not utils.file_info(partial) then
             return output, partial
@@ -135,14 +137,15 @@ local function finish_job(success, result, error_message)
     end
 
     if success and result and result.status == 0 then
-        local renamed, rename_error = os.rename(partial, output)
         clear_job()
-        if renamed then
-            notify("Cut complete: " .. output, 5)
-        else
-            mp.msg.error("Could not finalize cut: " .. tostring(rename_error))
-            notify("Cut completed but could not be renamed: " .. partial, 8)
-        end
+        notify("Cut complete: " .. output, 5)
+        return
+    end
+
+    if result and result.status == 2 then
+        mp.msg.error(result.stderr or result.error_string or "Could not finalize cut")
+        clear_job()
+        notify("Cut completed but could not be finalized: " .. partial, 8)
         return
     end
 
@@ -177,6 +180,7 @@ local function start_cut(first, second)
         return
     end
 
+    job_serial = job_serial + 1
     final_output, temporary_output = choose_output(input)
     progress_path = temporary_output .. ".progress"
 
@@ -194,6 +198,7 @@ local function start_cut(first, second)
             string.format("%.9f", cut_end),
             progress_path,
             opts.quality,
+            final_output,
         },
         playback_only = false,
         capture_stderr = true,
