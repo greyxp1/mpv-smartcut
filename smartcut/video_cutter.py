@@ -99,8 +99,6 @@ class VideoCutter:
         out_stream: VideoStream,
         output_av_container: OutputContainer,
     ) -> None:
-        self.encoder_inited = False
-
         self.enc_codec = None
 
         self.in_stream = cast(VideoStream, media_container.video_stream)
@@ -140,10 +138,12 @@ class VideoCutter:
 
         self.last_dts = -100_000_000
         self.segment_start_in_output = Fraction(0)
+        self.has_output_frames = False
 
         # Track stream continuity for hybrid CRA recoding
-        self.last_remuxed_segment_gop_index = None
-        self.is_first_remuxed_segment = True
+        self.last_remuxed_segment_gop_index: int | None = None
+
+        self.init_encoder()
 
     def prepare_gop(self, gop: VideoGop) -> None:
         self.previous_gop = self.current_gop
@@ -153,7 +153,6 @@ class VideoCutter:
         self.demux_saved_packet = None
 
     def init_encoder(self) -> None:
-        self.encoder_inited = True
         profile = self.out_stream.codec_context.profile
 
         codec_name = self.codec_name or ''
@@ -180,6 +179,10 @@ class VideoCutter:
         self.encoding_options = {'crf': str(crf_value)}
         if self.codec_name in ('mpeg2video', 'mpeg4', 'msmpeg4v2', 'msmpeg4v3'):
             self.encoding_options = {}
+        if self.codec_name == 'mpeg4' and self.in_stream.codec_context.has_b_frames:
+            # B-frames clear the in-band VOL low_delay flag like the copied GOPs.
+            # Otherwise the decoder repeats a frame at each join.
+            self.encoding_options['bf'] = '1'
         if self.codec_name in ('h264', 'hevc'):
             self.encoding_options['preset'] = 'ultrafast'
             if self.codec_name == 'hevc':
@@ -235,13 +238,6 @@ class VideoCutter:
         """Fix packet DTS/PTS to ensure monotonic increase and PTS >= DTS."""
         packet.stream = self.out_stream
         packet.time_base = self.out_time_base
-
-        # Treat garbage DTS values as None (can occur during encoder flush due to PyAV
-        # reading uninitialized memory when frame is None during flush)
-        # See: https://github.com/PyAV-Org/PyAV/issues/397
-        #      https://github.com/PyAV-Org/PyAV/discussions/933
-        if packet.dts is not None and (packet.dts < -900_000 or packet.dts > 1_000_000_000_000):
-            packet.dts = None
 
         if packet.dts is not None:
             if packet.dts <= self.last_dts:
@@ -345,7 +341,14 @@ class VideoCutter:
             and not self.current_gop.is_idr
             and self.last_remuxed_segment_gop_index != cut_segment.gop_index - 1
         )
-        if cut_segment.require_recode or needs_h264_recode:
+        # Leading B-frames of an open MPEG GOP need the previous GOP's last frame in the output.
+        needs_mpeg_recode = (
+            self.codec_name in ('mpeg2video', 'mpeg4')
+            and self.current_gop.needs_priming
+            and self.previous_gop is not None
+            and not self.has_output_frames
+        )
+        if cut_segment.require_recode or needs_h264_recode or needs_mpeg_recode:
             packets = self.recode_segment(cut_segment)
         elif self._should_hybrid_recode_cra(cut_segment):
             # CRA GOP with leading pictures: recode leading pics, remux rest
@@ -353,13 +356,13 @@ class VideoCutter:
             packets = self.hybrid_recode_cra_segment(cut_segment)
             # Update tracking variables (same as remux path)
             self.last_remuxed_segment_gop_index = cut_segment.gop_index
-            self.is_first_remuxed_segment = False
+            self.has_output_frames = True
         else:
             packets = self.flush_encoder()
             packets.extend(self.remux_segment(cut_segment))
             # Update tracking variables for hybrid CRA recoding
             self.last_remuxed_segment_gop_index = cut_segment.gop_index
-            self.is_first_remuxed_segment = False
+            self.has_output_frames = True
 
         for packet in packets:
             self._fix_packet_timestamps(packet)
@@ -374,12 +377,11 @@ class VideoCutter:
         return packets
 
     def recode_segment(self, s: CutSegment) -> list[Packet]:
-        if not self.encoder_inited:
-            self.init_encoder()
         result_packets = []
 
         self._ensure_enc_codec()
         assert self.enc_codec is not None
+        enc_tb = Fraction(self.enc_codec.time_base)
 
         # Open-GOP pictures may reference frames before the current keyframe.
         decoder_priming_dts = None
@@ -387,21 +389,15 @@ class VideoCutter:
         if self.previous_gop is not None and self.current_gop.needs_priming:
             decoder_priming_dts = self.previous_gop.start_dts
 
+        # fetch_frame stops at s.end_time.
         for frame in self.fetch_frame(s.gop_start_dts, s.gop_end_dts, s.end_time, decoder_priming_dts):
             assert frame.pts is not None, "Frame pts should not be None after decoding"
-            in_tb = frame.time_base or self.in_time_base
-            if frame.pts * in_tb < s.start_time:
+            time = frame.pts * (frame.time_base or self.in_time_base)
+            if time < s.start_time:
                 continue
-            if frame.pts * in_tb >= s.end_time:
-                break
 
-            out_tb = self.out_time_base if self.codec_name != 'mpeg2video' else self.enc_codec.time_base
-
-            frame.pts = int(frame.pts - s.start_time / in_tb)
-
-            frame.pts = int(frame.pts * in_tb / out_tb)
-            frame.time_base = out_tb
-            frame.pts = int(frame.pts + self.segment_start_in_output / out_tb)
+            frame.pts = round((time - s.start_time + self.segment_start_in_output) / enc_tb)
+            frame.time_base = enc_tb
 
             if frame.pts <= self.enc_last_pts:
                 frame.pts = int(self.enc_last_pts + 1)
@@ -409,13 +405,9 @@ class VideoCutter:
 
             frame.pict_type = PictureType.NONE
             frame = self._scale_frame_if_needed(frame)
-            result_packets.extend(self.enc_codec.encode(frame))
+            result_packets.extend(self._encode(frame))
+            self.has_output_frames = True
 
-        if self.codec_name == 'mpeg2video':
-            for p in result_packets:
-                p.pts = p.pts * p.time_base / self.out_time_base
-                p.dts = p.dts * p.time_base / self.out_time_base
-                p.time_base = self.out_time_base
         return result_packets
 
     def remux_segment(self, s: CutSegment) -> list[Packet]:
@@ -450,20 +442,14 @@ class VideoCutter:
             return False
 
         # Check 2: Must have discontinuity before this point
-        has_discontinuity = (
-            (self.is_first_remuxed_segment and s.gop_index > 0) or
-            (self.last_remuxed_segment_gop_index is not None and s.gop_index > self.last_remuxed_segment_gop_index + 1)
-        )
-        return has_discontinuity
+        last = self.last_remuxed_segment_gop_index
+        return s.gop_index > (0 if last is None else last + 1)
 
     def hybrid_recode_cra_segment(self, s: CutSegment) -> list[Packet]:
         """
         Hybrid recode for CRA GOPs: recode only leading pictures (RASL/RADL),
         remux CRA + trailing pictures unchanged.
         """
-        if not self.encoder_inited:
-            self.init_encoder()
-
         result_packets: list[Packet] = []
 
         # Same reference point as remux_segment
@@ -493,7 +479,7 @@ class VideoCutter:
             if frame.pts is not None and frame.pts * (frame.time_base or self.in_time_base) >= gop_start_time:
                 all_frames.append(frame)
 
-        # Get CRA PTS (collected_packets has only non-leading packets, i.e., just CRA)
+        # Get CRA PTS (collected_packets starts with the CRA, then at most the first trailing packet)
         assert len(collected_packets) > 0, "No CRA packet found in GOP"
         cra_pts = collected_packets[0].pts
         assert cra_pts is not None, "CRA packet has no PTS"
@@ -518,14 +504,9 @@ class VideoCutter:
             self.enc_last_pts = frame.pts
 
             frame.pict_type = PictureType.NONE
-            result_packets.extend(self.enc_codec.encode(frame))
+            result_packets.extend(self._encode(frame))
 
         result_packets.extend(self.flush_encoder())
-
-        # Fix encoder DTS
-        for p in result_packets:
-            if p.dts is None or p.dts > 1_000_000_000_000:
-                p.dts = p.pts
 
         # Remux: collected packets (CRA, leading already filtered in fetch_frame) + trailing
         # Handle in one loop with same timing as remux_segment
@@ -548,19 +529,22 @@ class VideoCutter:
         if self.enc_codec is None:
             return []
 
-        result_packets = self.enc_codec.encode()
-
-        if self.codec_name == 'mpeg2video':
-            for p in result_packets:
-                if p.time_base:
-                    if p.pts is not None:
-                        p.pts = int(p.pts * p.time_base / self.out_time_base)
-                    if p.dts is not None:
-                        p.dts = int(p.dts * p.time_base / self.out_time_base)
-                p.time_base = self.out_time_base
-
+        result_packets = self._encode(None)
         self.enc_codec = None
         return result_packets
+
+    def _encode(self, frame: VideoFrame | None) -> list[Packet]:
+        assert self.enc_codec is not None
+        packets = self.enc_codec.encode(frame)
+        if self.codec_name == 'mpeg2video':
+            # The MPEG-2 encoder uses a frame-rate time base.
+            for p in packets:
+                if p.pts is not None:
+                    p.pts = round(p.pts * p.time_base / self.out_time_base)
+                if p.dts is not None:
+                    p.dts = round(p.dts * p.time_base / self.out_time_base)
+                p.time_base = self.out_time_base
+        return packets
 
     def _scale_frame_if_needed(self, frame: VideoFrame) -> VideoFrame:
         """Scale frame to encoder dimensions if needed, using bilinear interpolation.

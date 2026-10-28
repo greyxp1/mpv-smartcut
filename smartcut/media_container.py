@@ -125,6 +125,8 @@ class MediaContainer:
                         break
                     has_leading = True
                     needs_priming |= is_rasl_nal_type(nal_type)
+        elif codec in ('mpeg2video', 'mpeg4'):
+            needs_priming = True
         return VideoGop(
             index,
             packets,
