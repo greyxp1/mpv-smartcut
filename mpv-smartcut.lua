@@ -12,29 +12,12 @@ options.read_options(opts, "mpv-smartcut")
 local mark
 local task
 local started
-local cancelling = false
-local kept_output
-local final_output
 local progress_path
 local job_serial = 0
 local overlay = mp.create_osd_overlay("ass-events")
 
-local function format_time(seconds)
-    local milliseconds = math.floor((seconds - math.floor(seconds)) * 1000 + 0.5)
-    local whole = math.floor(seconds)
-    local hours = math.floor(whole / 3600)
-    local minutes = math.floor(whole / 60) % 60
-    local secs = whole % 60
-    return string.format("%02d:%02d:%02d.%03d", hours, minutes, secs, milliseconds)
-end
-
 local function show_status(text)
     overlay.data = "{\\an8\\fs22\\bord2}" .. text
-    overlay:update()
-end
-
-local function hide_status()
-    overlay.data = ""
     overlay:update()
 end
 
@@ -44,91 +27,48 @@ local function notify(message, duration)
 end
 
 local function read_progress()
-    if not progress_path then return nil end
     local file = io.open(progress_path, "r")
     if not file then return nil end
-    local line = file:read("*l")
+    local completed, total = (file:read("*l") or ""):match("^(%d+),(%d+)$")
     file:close()
-    if not line then return nil end
-    local completed, total = line:match("^(%d+),(%d+)$")
-    completed, total = tonumber(completed), tonumber(total)
-    if not completed or not total or total == 0 then return nil end
-    return math.min(100, math.floor(completed * 100 / total))
+    if total and total ~= "0" then return math.floor(completed * 100 / total) end
 end
 
 local progress_timer = mp.add_periodic_timer(0.25, function()
-    if not task then return end
-    local elapsed = math.floor(mp.get_time() - started)
     local percent = read_progress()
-    local progress = percent and (" • " .. percent .. "%") or ""
-    local action = cancelling and "Cancelling" or "Smart cutting"
-    show_status(action .. progress .. " • " .. elapsed .. "s • " .. opts.cancel_key .. " cancel")
-end)
-progress_timer:kill()
-
-local function split_extension(filename)
-    local stem, extension = filename:match("^(.*)(%.[^.]*)$")
-    if not stem then
-        return filename, ".mkv"
-    end
-    return stem, extension
-end
+    show_status("Smart cutting" .. (percent and (" • " .. percent .. "%") or "") .. " • " ..
+        math.floor(mp.get_time() - started) .. "s • " .. opts.cancel_key .. " cancel")
+end, true)
 
 local function choose_output(input)
     local directory, filename = utils.split_path(input)
-    local stem, extension = split_extension(filename)
-    local suffix = ""
-    local index = 1
-
-    while true do
-        local output_name = opts.output_prefix .. stem .. suffix .. extension
-        if not utils.file_info(utils.join_path(directory, output_name)) then
-            return directory, output_name
-        end
+    local stem, extension = filename:match("^(.*)(%.[^.]*)$")
+    if not stem then stem, extension = filename, ".mkv" end
+    local name, index = opts.output_prefix .. stem .. extension, 1
+    while utils.file_info(utils.join_path(directory, name)) do
         index = index + 1
-        suffix = "_" .. index
+        name = opts.output_prefix .. stem .. "_" .. index .. extension
     end
+    return directory, name
 end
 
-local function finish_job(success, result, error_message)
-    local output = final_output
-    local kept = kept_output
-    local cancelled = cancelling
+local function finish_job(output, kept, success, result, error_message)
     task = nil
     progress_timer:kill()
-    cancelling = false
-    kept_output, final_output, progress_path = nil, nil, nil
-    hide_status()
+    overlay:remove()
 
-    if cancelled then
+    if result and result.killed_by_us then
         notify("Cut cancelled", 2)
-        return
-    end
-
-    if success and result and result.status == 0 then
+    elseif success and result.status == 0 then
         notify("Cut complete: " .. output, 5)
-        return
+    else
+        local detail = result and (result.stderr ~= "" and result.stderr or result.error_string)
+            or error_message or "unknown error"
+        detail = detail:gsub("%s+$", ""):sub(-500)
+        local failed = not (result and result.status == 2)
+        mp.msg.error((failed and "Cut failed: " or "") .. detail)
+        mp.osd_message(failed and "Cut failed: " .. detail or "Cut completed but could not be published: " .. kept, 8)
     end
-
-    local detail = error_message
-    if not detail and result then
-        if result.stderr and result.stderr ~= "" then
-            detail = result.stderr
-        else
-            detail = result.error_string
-        end
-    end
-    detail = detail and tostring(detail):gsub("%s+$", "") or "unknown error"
-    if #detail > 500 then detail = detail:sub(-500) end
-
-    if result and result.status == 2 then
-        mp.msg.error(detail)
-        mp.osd_message("Cut completed but could not be published: " .. kept, 8)
-        return
-    end
-
-    mp.msg.error("Cut failed: " .. detail)
-    mp.osd_message("Cut failed: " .. detail, 8)
 end
 
 local function start_cut(first, second)
@@ -137,10 +77,7 @@ local function start_cut(first, second)
         notify("Cut failed: input is not a local file", 5)
         return
     end
-
-    local cut_start = math.min(first, second)
-    local cut_end = math.max(first, second)
-    if cut_end <= cut_start then
+    if first == second then
         notify("Cut cancelled: empty selection", 4)
         return
     end
@@ -148,8 +85,8 @@ local function start_cut(first, second)
     job_serial = job_serial + 1
     local directory, output_name = choose_output(input)
     local job_directory = utils.join_path(directory, ".smartcut-" .. utils.getpid() .. "-" .. job_serial)
-    final_output = utils.join_path(directory, output_name)
-    kept_output = utils.join_path(job_directory, output_name)
+    local output = utils.join_path(directory, output_name)
+    local kept = utils.join_path(job_directory, output_name)
     progress_path = utils.join_path(job_directory, "progress")
 
     started = mp.get_time()
@@ -161,16 +98,15 @@ local function start_cut(first, second)
         args = {
             opts.backend,
             input,
-            string.format("%.9f", cut_start),
-            string.format("%.9f", cut_end),
+            string.format("%.9f", math.min(first, second)),
+            string.format("%.9f", math.max(first, second)),
             job_directory,
-            final_output,
+            output,
         },
         playback_only = false,
         capture_stderr = true,
-        capture_size = 1048576,
     }, function(success, result, error_message)
-        finish_job(success, result, error_message)
+        finish_job(output, kept, success, result, error_message)
     end)
 end
 
@@ -188,24 +124,21 @@ local function select_cut_point()
 
     if not mark then
         mark = position
-        show_status("Cut start " .. format_time(mark) .. " • " .. opts.cut_key .. " end • " ..
+        show_status("Cut start " .. mp.get_property_osd("time-pos/full") .. " • " .. opts.cut_key .. " end • " ..
             opts.cancel_key .. " cancel")
         return
     end
 
-    local first = mark
+    start_cut(mark, position)
     mark = nil
-    start_cut(first, position)
 end
 
 local function cancel_cut()
     if task then
-        cancelling = true
         mp.abort_async_command(task)
-        show_status("Cancelling…")
     elseif mark then
         mark = nil
-        hide_status()
+        overlay:remove()
         notify("Selection cancelled", 2)
     end
 end
@@ -216,6 +149,6 @@ mp.add_forced_key_binding(opts.cancel_key, "mpv-smartcut-cancel", cancel_cut)
 mp.register_event("file-loaded", function()
     if not task then
         mark = nil
-        hide_status()
+        overlay:remove()
     end
 end)
