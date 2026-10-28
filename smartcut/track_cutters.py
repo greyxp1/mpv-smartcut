@@ -27,18 +27,27 @@ class PassthroughCutter:
         self.last_dts = -100_000
 
     def packet(self, packet: Packet) -> Packet | None:
-        if packet.pts is None or not self.start_pts <= packet.pts < self.end_pts:
+        if packet.pts is None:
             return None
-        if packet.dts is None and packet.stream.type == 'audio':
+        start = packet.pts
+        if packet.stream.type == 'subtitle' and packet.duration:
+            # Keep cues overlapping the selection and clip them to it.
+            start = max(start, self.start_pts)
+            end = min(packet.pts + packet.duration, self.end_pts)
+            if start >= end:
+                return None
+            packet.duration = end - start
+        elif not self.start_pts <= start < self.end_pts:
+            return None
+        elif packet.dts is None and packet.stream.type == 'audio':
             return None
         # Truncate the shifted timestamp toward zero without per-packet fractions.
-        pts = packet.pts - (self.offset_ceil if packet.pts >= self.offset_ceil else self.offset_floor)
+        pts = start - (self.offset_ceil if start >= self.offset_ceil else self.offset_floor)
         if packet.stream.type == 'subtitle':
             packet.pts = max(pts, self.last_pts)
             packet.dts = packet.pts
         else:
-            dts = packet.dts if packet.dts is not None else packet.pts
-            dts -= self.offset_ceil if dts >= self.offset_ceil else self.offset_floor
+            dts = packet.dts - (self.offset_ceil if packet.dts >= self.offset_ceil else self.offset_floor)
             packet.pts = max(pts, self.last_pts + 1)
             packet.dts = max(dts, self.last_dts + 1)
         self.last_pts = packet.pts
