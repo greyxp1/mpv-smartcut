@@ -1,19 +1,14 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=77.0.3"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "mpv-smartcut"
 version = "0.1.0"
 description = "Frame-accurate smart cutting backend and mpv frontend"
-readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
-authors = [{name = "greyxp1"}]
 dependencies = ["av>=19,<20"]
 
 [project.scripts]
 mpv-smartcut-backend = "smartcut.__main__:main"
-
-[tool.setuptools]
-packages = ["smartcut"]

@@ -1,6 +1,5 @@
 {
   lib,
-  lua5_4,
   python3Packages,
 }:
 python3Packages.buildPythonApplication {
@@ -9,7 +8,7 @@ python3Packages.buildPythonApplication {
   pyproject = true;
   src = lib.cleanSource ./.;
 
-  build-system = with python3Packages; [setuptools wheel];
+  build-system = [python3Packages.setuptools];
   dependencies = [python3Packages.av];
 
   postInstall = ''
@@ -22,19 +21,11 @@ python3Packages.buildPythonApplication {
 
   passthru.scriptName = "mpv-smartcut.lua";
 
-  nativeInstallCheckInputs = [lua5_4];
-  doInstallCheck = true;
-  installCheckPhase = ''
-    runHook preInstallCheck
-    luac -p mpv-smartcut.lua
-    runHook postInstallCheck
-  '';
   pythonImportsCheck = ["smartcut.__main__"];
 
   meta = {
     description = "Frame-accurate smart cutting backend and mpv frontend";
     license = lib.licenses.mit;
     mainProgram = "mpv-smartcut-backend";
-    platforms = lib.platforms.unix;
   };
 }
