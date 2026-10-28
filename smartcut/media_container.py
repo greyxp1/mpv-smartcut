@@ -48,7 +48,6 @@ class MediaContainer:
             stream for stream in container.streams
             if stream.type in ('audio', 'subtitle') and stream.time_base
         ]
-        self.passthrough_packets: list[Packet] = []
         self.streams = [*self.passthrough_streams]
         if self.video_stream is not None:
             self.video_stream.thread_type = 'SLICE'
@@ -56,14 +55,16 @@ class MediaContainer:
             self.streams.insert(0, self.video_stream)
 
         start = selection[0] + self.start_time
-        if start > self.start_time:
-            if self.video_stream is not None:
-                # Include the previous GOP for open-GOP decoding references.
-                keyframe = self._seek_keyframe(int(start / self.video_stream.time_base))
-                if keyframe is not None:
-                    self._seek_keyframe(keyframe - 1)
-            else:
+        video = self.video_stream
+        if video is None:
+            if start > self.start_time:
                 container.seek(int(start * AV_TIME_BASE))
+        # Seeking by video before its first keyframe would skip earlier audio.
+        elif start > (video.start_time or 0) * video.time_base:
+            # Include the previous GOP for open-GOP decoding references.
+            keyframe = self._seek_keyframe(int(start / video.time_base))
+            if keyframe is not None:
+                self._seek_keyframe(keyframe - 1)
 
     def _seek_keyframe(self, timestamp: int) -> int | None:
         """Seek before the keyframe at or preceding timestamp and return its timestamp.
@@ -81,7 +82,7 @@ class MediaContainer:
                 for packet in self.av_container.demux(video)
                 if packet.is_keyframe and packet.pts is not None
             ), None)
-            if keyframe is None or keyframe <= timestamp or target <= (video.start_time or 0):
+            if (keyframe is not None and keyframe <= timestamp) or target <= (video.start_time or 0):
                 self.av_container.seek(target, stream=video)
                 return keyframe
             target -= step
@@ -131,53 +132,62 @@ class MediaContainer:
             is_idr,
         )
 
-    def gops(self, end_time: Fraction) -> Iterator[tuple[VideoGop, Fraction]]:
-        pending = None
+    def demux(self, end_time: Fraction) -> Iterator[Packet | tuple[VideoGop, Fraction]]:
+        """Yield passthrough packets before end_time and video GOPs with their end times.
+
+        Stops reading once audio and video reach end_time. Sparse subtitle tracks
+        may have no later cue, and their earlier cues are interleaved before that.
+        """
+        open_streams = {stream.index for stream in self.streams}
+        subtitle_streams = {stream.index for stream in self.streams if stream.type == 'subtitle'}
+        previous = None
         packets: list[Packet] = []
         index = 0
         for packet in self.av_container.demux(self.streams):
-            if packet.pts is None:
+            if packet.pts is None or packet.stream_index not in open_streams:
                 continue
             if packet.stream.type != 'video':
-                self.passthrough_packets.append(packet)
-                continue
-            if not packets and not self._gop_boundary(packet):
-                # Unindexed seeks can land after a keyframe.
-                continue
-            if packets and self._gop_boundary(packet):
-                gop = self._gop(index, packets)
-                index += 1
-                if pending is not None:
-                    yield pending, gop.start_time
-                    if gop.start_time >= end_time:
-                        return
-                pending = gop
-                packets = []
-            packets.append(packet)
+                if packet.pts * packet.time_base < end_time:
+                    yield packet
+                    continue
+            else:
+                boundary = self._gop_boundary(packet)
+                if not packets and not boundary:
+                    # Unindexed seeks can land after a keyframe.
+                    continue
+                if packets and boundary:
+                    gop = self._gop(index, packets)
+                    index += 1
+                    if previous is not None:
+                        yield previous, gop.start_time
+                    previous, packets = gop, []
+                packets.append(packet)
+                if previous is not None and previous.start_time >= end_time:
+                    packets = []
+                elif packet.dts is not None and packet.dts * packet.time_base >= end_time:
+                    # Later packets decode after this one, so they also display after end_time.
+                    yield from self._last_gops(previous, index, packets, (packet.pts + 1) * packet.time_base)
+                    packets = []
+                else:
+                    continue
+            open_streams.discard(packet.stream_index)
+            if open_streams <= subtitle_streams:
+                return
 
         if packets:
-            gop = self._gop(index, packets)
-            if pending is not None:
-                yield pending, gop.start_time
-                if gop.start_time >= end_time:
-                    return
             if self.duration is not None:
                 end = self.start_time + self.duration + Fraction(1, 10_000)
             else:
                 end = max((p.pts + (p.duration or 1)) * p.time_base for p in packets)
-            yield gop, end
+            yield from self._last_gops(previous, index, packets, end)
 
-    def take_passthrough_packets(self, end_time: Fraction) -> Iterator[Packet]:
-        end_pts = {
-            stream.index: ceil(end_time / stream.time_base)
-            for stream in self.passthrough_streams
-        }
-        packets, self.passthrough_packets = self.passthrough_packets, []
-        for packet in packets:
-            if packet.pts < end_pts[packet.stream_index]:
-                yield packet
-            else:
-                self.passthrough_packets.append(packet)
+    def _last_gops(
+        self, previous: VideoGop | None, index: int, packets: list[Packet], end: Fraction,
+    ) -> Iterator[tuple[VideoGop, Fraction]]:
+        gop = self._gop(index, packets)
+        if previous is not None:
+            yield previous, gop.start_time
+        yield gop, end
 
     def close(self) -> None:
         self.av_container.close()

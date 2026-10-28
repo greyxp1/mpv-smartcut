@@ -28,8 +28,8 @@ output_prefix=cut_
 HEVC and AV1 boundaries use NVENC on NVIDIA GPUs, which is 10 to 20 times
 faster than the software encoders used otherwise.
 
-H.264 open GOPs may need re-encoding until the next IDR frame. Audio-only files
-with unknown track durations may be read to the end.
+H.264 open GOPs may need re-encoding until the next IDR frame. Files with an
+audio track that ends before the cut may be read to the end.
 
 Existing files are never overwritten. If the output name is taken by the time a
 cut finishes, the completed hidden partial file is kept and its path is shown.

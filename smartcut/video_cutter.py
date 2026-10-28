@@ -360,8 +360,6 @@ class VideoCutter:
             self.last_remuxed_segment_gop_index = cut_segment.gop_index
             self.is_first_remuxed_segment = False
 
-        self.segment_start_in_output += cut_segment.end_time - cut_segment.start_time
-
         for packet in packets:
             self._fix_packet_timestamps(packet)
 
