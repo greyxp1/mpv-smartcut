@@ -24,7 +24,7 @@ class Progress:
 
 
 def main() -> None:
-    input_path, output_path, start, end, progress_path, quality, final_path = sys.argv[1:]
+    input_path, output_path, start, end, progress_path, final_path = sys.argv[1:]
     selection = (Fraction(start), Fraction(end))
     source = MediaContainer(input_path, selection)
     try:
@@ -33,7 +33,6 @@ def main() -> None:
                 source,
                 selection,
                 output,
-                quality,
                 Progress(progress_path),
             )
     finally:

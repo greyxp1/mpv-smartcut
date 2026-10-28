@@ -31,14 +31,12 @@ backend=mpv-smartcut-backend
 cut_key=c
 cancel_key=C
 output_prefix=cut_
-quality=high
 ```
 
-`quality` controls only the small re-encoded boundary GOPs and accepts `low`,
-`normal`, `high`, `indistinguishable`, `near-lossless`, or `lossless`.
-The default, `high`, targets near-lossless boundary quality. H.264, HEVC, VP8,
-VP9, and AV1 use fast software encoder settings for these boundaries, trading
-larger boundary GOPs for speed. HEVC and AV1 boundaries with 4:2:0 video use
+Only the small boundary GOPs around each cut are re-encoded, at near-lossless
+quality so they blend with the copied video. H.264, HEVC, VP8, VP9, and AV1 use
+fast software encoder settings for these boundaries, trading larger boundary
+GOPs for speed. HEVC and AV1 boundaries with 4:2:0 video use
 NVENC when an NVIDIA GPU supports it, which is about 10 to 20 times faster than
 software at equal quality.
 Codec threading is bounded, and decoded frames are consumed directly to limit
@@ -47,8 +45,7 @@ Independent complete GOPs are copied unchanged. H.264 open GOPs may require
 re-encoding until the next independent keyframe. Encoding speed still depends
 on the codec, resolution, and distance to the nearest keyframes.
 Audio-only files with unknown track durations may need to be read to EOF.
-Older MPEG encoders use quantizer-based quality. `lossless` requires a codec
-that supports it, otherwise the highest available quality is used.
+Older MPEG encoders use their finest quantizer instead.
 
 Cuts are written to a unique hidden partial file and published only after success.
 Partial output is deleted when processing fails, is cancelled, or mpv exits.

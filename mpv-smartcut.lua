@@ -6,7 +6,6 @@ local opts = {
     cut_key = "c",
     cancel_key = "C",
     output_prefix = "cut_",
-    quality = "high",
 }
 options.read_options(opts, "mpv-smartcut")
 
@@ -197,7 +196,6 @@ local function start_cut(first, second)
             string.format("%.9f", cut_start),
             string.format("%.9f", cut_end),
             progress_path,
-            opts.quality,
             final_output,
         },
         playback_only = false,

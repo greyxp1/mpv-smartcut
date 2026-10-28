@@ -29,15 +29,6 @@ class CutSegment:
 
 NVENC_PIX_FMTS = {'yuv420p': 'yuv420p', 'nv12': 'nv12', 'yuv420p10le': 'p010le', 'p010le': 'p010le'}
 
-CRF_BY_QUALITY = {
-    "low": 23,
-    "normal": 18,
-    "high": 3,
-    "indistinguishable": 3,
-    "near-lossless": 3,
-    "lossless": 0,
-}
-
 
 def is_annexb(packet: Packet | bytes | None) -> bool:
     if packet is None:
@@ -106,10 +97,8 @@ class VideoCutter:
         media_container: MediaContainer,
         out_stream: VideoStream,
         output_av_container: OutputContainer,
-        quality: str,
     ) -> None:
         self.encoder_inited = False
-        self.quality = quality
 
         self.enc_codec = None
 
@@ -182,16 +171,9 @@ class VideoCutter:
             else:
                 profile = profile.lower().replace(':', '').replace(' ', '')
 
-        crf_value = CRF_BY_QUALITY[self.quality]
-
-        # Adjust CRF for newer codecs that are more efficient
-        if self.codec_name in ['hevc', 'av1', 'vp9']:
-            crf_value += 4
-        if self.quality == "lossless":
-            crf_value = 0
-            if self.codec_name == 'h264':
-                # x264 selects High 4:4:4 Predictive for lossless, even with 4:2:0 input.
-                profile = None
+        # Near-lossless boundaries blend with the copied GOPs. Newer codecs are
+        # more efficient at the same CRF.
+        crf_value = 7 if self.codec_name in ('hevc', 'av1', 'vp9') else 3
 
         self.encoding_options = {'crf': str(crf_value)}
         if self.codec_name in ('mpeg2video', 'mpeg4', 'msmpeg4v2', 'msmpeg4v3'):
@@ -221,8 +203,6 @@ class VideoCutter:
                 'row-mt': '1',
                 'lag-in-frames': '0',
             })
-        if self.codec_name == 'vp9' and self.quality == "lossless":
-            self.encoding_options['lossless'] = '1'
         if profile is not None:
             self.encoding_options['profile'] = profile
 
@@ -240,24 +220,14 @@ class VideoCutter:
                 'repeat-headers=1', 'info=0', 'log-level=error',
                 f'pools={CODEC_THREADS}', 'frame-threads=1',
             ]
-
-            if self.quality == "lossless":
-                x265_params.append('lossless=1')
-
             self.encoding_options['x265-params'] = ':'.join(x265_params)
 
         # NVENC encodes 4K HEVC and AV1 boundaries about 10-20x faster than
         # software at equal PSNR. AV1 uses a 0-255 quantizer scale.
         self.nvenc_options: dict[str, str] | None = None
         if self.codec_name in ('hevc', 'av1'):
-            self.nvenc_options = {'preset': 'p1', 'bf': '0'}
-            if self.quality != 'lossless':
-                qp = crf_value * 3 if self.codec_name == 'av1' else crf_value
-                self.nvenc_options.update({'rc': 'constqp', 'qp': str(qp)})
-            elif self.codec_name == 'hevc':
-                self.nvenc_options['tune'] = 'lossless'
-            else:
-                self.nvenc_options = None
+            qp = crf_value * 3 if self.codec_name == 'av1' else crf_value
+            self.nvenc_options = {'preset': 'p1', 'bf': '0', 'rc': 'constqp', 'qp': str(qp)}
 
     def _fix_packet_timestamps(self, packet: Packet) -> None:
         """Fix packet DTS/PTS to ensure monotonic increase and PTS >= DTS."""
@@ -320,17 +290,9 @@ class VideoCutter:
             enc_codec.rate = rate
         enc_codec.options.update(options)
         if self.codec_name in ('mpeg2video', 'mpeg4', 'msmpeg4v2', 'msmpeg4v3'):
-            # Native MPEG encoders use a quantizer instead of CRF.
-            quantizer = {
-                'low': 8,
-                'normal': 5,
-                'high': 1,
-                'indistinguishable': 1,
-                'near-lossless': 1,
-                'lossless': 1,
-            }[self.quality]
+            # Native MPEG encoders use their finest quantizer instead of CRF.
             enc_codec.qscale = True
-            enc_codec.global_quality = quantizer * 118  # FF_QP2LAMBDA
+            enc_codec.global_quality = 118  # FF_QP2LAMBDA
 
         enc_codec.width = muxing_codec.width
         enc_codec.height = muxing_codec.height

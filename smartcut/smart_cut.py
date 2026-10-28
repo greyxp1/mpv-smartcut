@@ -29,7 +29,6 @@ def smart_cut(
     media_container: MediaContainer,
     selection: tuple[Fraction, Fraction],
     output_path: str | BinaryIO,
-    quality: str,
     progress: Progress,
 ) -> None:
     start, end = adjust_range(selection, media_container)
@@ -45,7 +44,7 @@ def smart_cut(
         video_cutter = None
         if media_container.video_stream is not None:
             video_stream = create_video_output_stream(media_container, output)
-            video_cutter = VideoCutter(media_container, video_stream, output, quality)
+            video_cutter = VideoCutter(media_container, video_stream, output)
         streams = {
             stream.index: create_output_stream(output, stream)
             for stream in media_container.passthrough_streams
