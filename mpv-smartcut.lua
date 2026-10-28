@@ -13,8 +13,7 @@ local mark
 local task
 local started
 local cancelling = false
-local shutting_down = false
-local temporary_output
+local kept_output
 local final_output
 local progress_path
 local job_serial = 0
@@ -41,24 +40,7 @@ end
 
 local function notify(message, duration)
     mp.msg.info(message)
-    if not shutting_down then
-        mp.osd_message(message, duration or 3)
-    end
-end
-
-local function remove_file(path)
-    if path then
-        local removed, error_message = os.remove(path)
-        if not removed and utils.file_info(path) then
-            mp.msg.warn("Could not remove " .. path .. ": " .. tostring(error_message))
-        end
-    end
-end
-
-local function cleanup_job_files()
-    remove_file(temporary_output)
-    remove_file(progress_path)
-    remove_file(progress_path and progress_path .. ".tmp")
+    mp.osd_message(message, duration or 3)
 end
 
 local function read_progress()
@@ -100,55 +82,33 @@ local function choose_output(input)
 
     while true do
         local output_name = opts.output_prefix .. stem .. suffix .. extension
-        local output = utils.join_path(directory, output_name)
-        local partial = utils.join_path(
-            directory,
-            "." .. opts.output_prefix .. stem .. suffix .. ".partial." ..
-                utils.getpid() .. "." .. job_serial .. extension
-        )
-        if not utils.file_info(output) and not utils.file_info(partial) then
-            return output, partial
+        if not utils.file_info(utils.join_path(directory, output_name)) then
+            return directory, output_name
         end
         index = index + 1
         suffix = "_" .. index
     end
 end
 
-local function clear_job()
+local function finish_job(success, result, error_message)
+    local output = final_output
+    local kept = kept_output
+    local cancelled = cancelling
     task = nil
     progress_timer:kill()
     cancelling = false
-    temporary_output, final_output, progress_path = nil, nil, nil
+    kept_output, final_output, progress_path = nil, nil, nil
     hide_status()
-end
 
-local function finish_job(success, result, error_message)
-    local output = final_output
-    local partial = temporary_output
-    remove_file(progress_path)
-    remove_file(progress_path .. ".tmp")
-
-    if cancelling then
-        remove_file(partial)
-        clear_job()
+    if cancelled then
         notify("Cut cancelled", 2)
         return
     end
 
     if success and result and result.status == 0 then
-        clear_job()
         notify("Cut complete: " .. output, 5)
         return
     end
-
-    if result and result.status == 2 then
-        mp.msg.error(result.stderr or result.error_string or "Could not finalize cut")
-        clear_job()
-        notify("Cut completed but could not be finalized: " .. partial, 8)
-        return
-    end
-
-    remove_file(partial)
 
     local detail = error_message
     if not detail and result then
@@ -160,9 +120,15 @@ local function finish_job(success, result, error_message)
     end
     detail = detail and tostring(detail):gsub("%s+$", "") or "unknown error"
     if #detail > 500 then detail = detail:sub(-500) end
-    clear_job()
+
+    if result and result.status == 2 then
+        mp.msg.error(detail)
+        mp.osd_message("Cut completed but could not be published: " .. kept, 8)
+        return
+    end
+
     mp.msg.error("Cut failed: " .. detail)
-    notify("Cut failed: " .. detail, 8)
+    mp.osd_message("Cut failed: " .. detail, 8)
 end
 
 local function start_cut(first, second)
@@ -180,8 +146,11 @@ local function start_cut(first, second)
     end
 
     job_serial = job_serial + 1
-    final_output, temporary_output = choose_output(input)
-    progress_path = temporary_output .. ".progress"
+    local directory, output_name = choose_output(input)
+    local job_directory = utils.join_path(directory, ".smartcut-" .. utils.getpid() .. "-" .. job_serial)
+    final_output = utils.join_path(directory, output_name)
+    kept_output = utils.join_path(job_directory, output_name)
+    progress_path = utils.join_path(job_directory, "progress")
 
     started = mp.get_time()
     show_status("Smart cutting • 0s • " .. opts.cancel_key .. " cancel")
@@ -192,10 +161,9 @@ local function start_cut(first, second)
         args = {
             opts.backend,
             input,
-            temporary_output,
             string.format("%.9f", cut_start),
             string.format("%.9f", cut_end),
-            progress_path,
+            job_directory,
             final_output,
         },
         playback_only = false,
@@ -234,7 +202,6 @@ local function cancel_cut()
     if task then
         cancelling = true
         mp.abort_async_command(task)
-        cleanup_job_files()
         show_status("Cancelling…")
     elseif mark then
         mark = nil
@@ -250,14 +217,5 @@ mp.register_event("file-loaded", function()
     if not task then
         mark = nil
         hide_status()
-    end
-end)
-
-mp.register_event("shutdown", function()
-    shutting_down = true
-    if task then
-        cancelling = true
-        mp.abort_async_command(task)
-        cleanup_job_files()
     end
 end)

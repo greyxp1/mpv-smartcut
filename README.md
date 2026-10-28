@@ -31,5 +31,7 @@ faster than the software encoders used otherwise.
 H.264 open GOPs may need re-encoding until the next IDR frame. Files with an
 audio track that ends before the cut may be read to the end.
 
-Existing files are never overwritten. If the output name is taken by the time a
-cut finishes, the completed hidden partial file is kept and its path is shown.
+Existing files are never overwritten. A cut is written to a hidden directory
+next to the source and published with a hard link. If the output name is taken
+by then, or the filesystem has no hard links (FAT and some network mounts), the
+completed cut stays in the hidden directory and its path is shown.
