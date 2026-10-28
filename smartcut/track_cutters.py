@@ -1,22 +1,21 @@
 from fractions import Fraction
 from math import ceil, floor
-from typing import cast
 
 from av.container.output import OutputContainer
 from av.packet import Packet
-from av.stream import Disposition, Stream
+from av.stream import Stream
 
 
 def create_output_stream(output: OutputContainer, stream: Stream) -> Stream:
-    out_stream = output.add_stream_from_template(stream)
+    # Video needs opaque=True for codecs without an encoder, such as VC-1.
+    out_stream = output.add_stream_from_template(stream, opaque=True)
     out_stream.metadata.update(stream.metadata)
-    out_stream.disposition = cast(Disposition, stream.disposition.value)
+    out_stream.disposition = stream.disposition
     return out_stream
 
 
 class PassthroughCutter:
     def __init__(self, in_stream: Stream, out_stream: Stream, start: Fraction, end: Fraction, *, offset: Fraction) -> None:
-        assert in_stream.time_base
         self.out_stream = out_stream
         offset_pts = offset / in_stream.time_base
         self.offset_floor = floor(offset_pts)
@@ -27,8 +26,6 @@ class PassthroughCutter:
         self.last_dts = -100_000
 
     def packet(self, packet: Packet) -> Packet | None:
-        if packet.pts is None:
-            return None
         start = packet.pts
         if packet.stream.type == 'subtitle' and packet.duration:
             # Keep cues overlapping the selection and clip them to it.

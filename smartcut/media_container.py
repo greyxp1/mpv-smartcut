@@ -4,35 +4,68 @@ from fractions import Fraction
 from math import ceil
 from os import cpu_count
 
-from av import Packet, VideoStream
+from av import Packet
 from av import open as av_open
 from av import time_base as AV_TIME_BASE
 from av.stream import Disposition
-
-from smartcut.nal_tools import (
-    get_h264_nal_unit_type,
-    get_h265_nal_unit_type,
-    get_nal_length_size,
-    is_leading_picture_nal_type,
-    is_rasl_nal_type,
-    is_safe_h265_keyframe_nal,
-)
 
 
 # Leave memory and CPU headroom for mpv and other desktop applications.
 CODEC_THREADS = min(4, cpu_count() or 1)
 
 
+def nal_length_size(codec: str, extradata: bytes | None) -> int:
+    """Read AVC/HEVC configuration records, or use Annex B without one."""
+    index = {'h264': 4, 'hevc': 21}.get(codec)
+    if index is not None and extradata and len(extradata) > index and extradata[0] == 1:
+        return (extradata[index] & 3) + 1
+    return 0
+
+
+def _nal_headers(data: bytes, length_size: int, header_size: int) -> Iterator[int]:
+    offset = 0
+    if length_size:
+        while offset + length_size <= len(data):
+            size = int.from_bytes(data[offset:offset + length_size], 'big')
+            offset += length_size
+            if size < header_size or offset + size > len(data):
+                return
+            yield data[offset]
+            offset += size
+    else:
+        while (start := data.find(b'\0\0\1', offset)) != -1:
+            offset = start + 3
+            if offset + header_size <= len(data):
+                yield data[offset]
+
+
+def h264_is_idr(data: bytes, length_size: int) -> bool:
+    return any(header & 0x1F == 5 for header in _nal_headers(data, length_size, 1))
+
+
+def h265_nal_type(data: bytes, length_size: int) -> int | None:
+    """Prefer BLA/IDR, then CRA, other pictures, and finally metadata."""
+    first = picture = None
+    cra = False
+    for header in _nal_headers(data, length_size, 2):
+        nal_type = (header >> 1) & 0x3F
+        if 16 <= nal_type <= 20:
+            return nal_type
+        cra |= nal_type == 21
+        if first is None:
+            first = nal_type
+        if picture is None and nal_type <= 15:
+            picture = nal_type
+    return 21 if cra else picture if picture is not None else first
+
+
 @dataclass
 class VideoGop:
-    index: int
     packets: list[Packet]
     start_time: Fraction
-    start_dts: int
-    end_dts: int
-    leading_end_dts: int | None
+    # HEVC RADL/RASL pictures directly after a CRA.
+    leading_count: int
     needs_priming: bool
-    is_idr: bool
 
 
 class MediaContainer:
@@ -40,31 +73,27 @@ class MediaContainer:
         self.av_container = container = av_open(path, 'r')
         self.start_time = Fraction(container.start_time, AV_TIME_BASE) if container.start_time is not None else Fraction(0)
         self.duration = Fraction(container.duration, AV_TIME_BASE) if container.duration is not None else None
-        self.video_stream: VideoStream | None = next((
+        self.video_stream = video = next((
             stream for stream in container.streams.video
             if Disposition.attached_pic not in stream.disposition
         ), None)
-        self.nal_length_size = get_nal_length_size(
-            self.video_stream.codec_context.name,
-            self.video_stream.codec_context.extradata,
-        ) if self.video_stream is not None else 0
         self.passthrough_streams = [
             stream for stream in container.streams
             if stream.type in ('audio', 'subtitle') and stream.time_base
         ]
-        self.streams = [*self.passthrough_streams]
-        if self.video_stream is not None:
-            self.video_stream.thread_type = 'SLICE'
-            self.video_stream.codec_context.thread_count = CODEC_THREADS
-            self.streams.insert(0, self.video_stream)
+        self.streams = [stream for stream in (video, *self.passthrough_streams) if stream is not None]
 
         start = selection[0] + self.start_time
-        video = self.video_stream
         if video is None:
             if start > self.start_time:
                 container.seek(int(start * AV_TIME_BASE))
+            return
+        self.codec = video.codec_context.name
+        self.nal_length_size = nal_length_size(self.codec, video.codec_context.extradata)
+        video.thread_type = 'SLICE'
+        video.codec_context.thread_count = CODEC_THREADS
         # Seeking by video before its first keyframe would skip earlier audio.
-        elif start > (video.start_time or 0) * video.time_base:
+        if start > (video.start_time or 0) * video.time_base:
             # Include the previous GOP for open-GOP decoding references.
             keyframe = self._seek_keyframe(int(start / video.time_base))
             if keyframe is not None:
@@ -76,7 +105,6 @@ class MediaContainer:
         Formats without a keyframe index, such as MPEG-TS, can land anywhere.
         """
         video = self.video_stream
-        assert video is not None and video.time_base
         step = ceil(1 / video.time_base)
         target = timestamp
         while True:
@@ -92,51 +120,24 @@ class MediaContainer:
             target -= step
             step *= 2
 
-    def _gop_boundary(self, packet: Packet) -> bool:
-        if not packet.is_keyframe:
-            return False
-        assert self.video_stream is not None
-        codec = self.video_stream.codec_context.name
-        if codec == 'hevc':
-            return is_safe_h265_keyframe_nal(get_h265_nal_unit_type(bytes(packet), self.nal_length_size))
-        return True
-
-    def _gop(self, index: int, packets: list[Packet]) -> VideoGop:
-        first, last = packets[0], packets[-1]
-        assert first.time_base is not None and last.pts is not None
-        leading_end_dts = None
+    def _gop(self, packets: list[Packet]) -> VideoGop:
+        first = packets[0]
+        leading_count = 0
         needs_priming = False
-        is_idr = False
-        assert self.video_stream is not None
-        codec = self.video_stream.codec_context.name
-        if codec == 'h264':
-            is_idr = get_h264_nal_unit_type(bytes(first), self.nal_length_size) == 5
-            needs_priming = not is_idr
-        elif codec == 'hevc':
-            nal_type = get_h265_nal_unit_type(bytes(first), self.nal_length_size)
-            is_idr = nal_type in (19, 20)
-            if nal_type == 21:
-                has_leading = False
+        if self.codec == 'h264':
+            needs_priming = not h264_is_idr(bytes(first), self.nal_length_size)
+        elif self.codec == 'hevc':
+            if h265_nal_type(bytes(first), self.nal_length_size) == 21:
                 for packet in packets[1:]:
-                    nal_type = get_h265_nal_unit_type(bytes(packet), self.nal_length_size)
-                    if not is_leading_picture_nal_type(nal_type):
-                        if has_leading:
-                            leading_end_dts = packet.dts
+                    nal_type = h265_nal_type(bytes(packet), self.nal_length_size)
+                    if nal_type not in (6, 7, 8, 9):
                         break
-                    has_leading = True
-                    needs_priming |= is_rasl_nal_type(nal_type)
-        elif codec in ('mpeg2video', 'mpeg4'):
+                    leading_count += 1
+                    # RASL pictures reference frames before the CRA.
+                    needs_priming |= nal_type in (8, 9)
+        elif self.codec in ('mpeg2video', 'mpeg4'):
             needs_priming = True
-        return VideoGop(
-            index,
-            packets,
-            min(packet.pts for packet in packets) * Fraction(first.time_base),
-            first.dts if first.dts is not None else -100_000_000,
-            last.dts if last.dts is not None else last.pts,
-            leading_end_dts,
-            needs_priming,
-            is_idr,
-        )
+        return VideoGop(packets, min(packet.pts for packet in packets) * first.time_base, leading_count, needs_priming)
 
     def demux(self, end_time: Fraction) -> Iterator[Packet | tuple[VideoGop, Fraction]]:
         """Yield passthrough packets before end_time and video GOPs with their end times.
@@ -146,9 +147,8 @@ class MediaContainer:
         """
         open_streams = {stream.index for stream in self.streams}
         subtitle_streams = {stream.index for stream in self.streams if stream.type == 'subtitle'}
-        previous = None
+        previous = end = None
         packets: list[Packet] = []
-        index = 0
         for packet in self.av_container.demux(self.streams):
             if packet.pts is None or packet.stream_index not in open_streams:
                 continue
@@ -157,13 +157,15 @@ class MediaContainer:
                     yield packet
                     continue
             else:
-                boundary = self._gop_boundary(packet)
+                boundary = packet.is_keyframe and (
+                    self.codec != 'hevc'
+                    or h265_nal_type(bytes(packet), self.nal_length_size) in (None, 16, 17, 18, 19, 20, 21, 32, 33, 34)
+                )
                 if not packets and not boundary:
                     # Unindexed seeks can land after a keyframe.
                     continue
                 if packets and boundary:
-                    gop = self._gop(index, packets)
-                    index += 1
+                    gop = self._gop(packets)
                     if previous is not None:
                         yield previous, gop.start_time
                     previous, packets = gop, []
@@ -172,28 +174,19 @@ class MediaContainer:
                     packets = []
                 elif packet.dts is not None and packet.dts * packet.time_base >= end_time:
                     # Later packets decode after this one, so they also display after end_time.
-                    yield from self._last_gops(previous, index, packets, (packet.pts + 1) * packet.time_base)
-                    packets = []
+                    end = (packet.pts + 1) * packet.time_base
                 else:
                     continue
             open_streams.discard(packet.stream_index)
             if open_streams <= subtitle_streams:
-                return
+                break
 
         if packets:
-            if self.duration is not None:
-                end = self.start_time + self.duration + Fraction(1, 10_000)
-            else:
-                end = max((p.pts + (p.duration or 1)) * p.time_base for p in packets)
-            yield from self._last_gops(previous, index, packets, end)
-
-    def _last_gops(
-        self, previous: VideoGop | None, index: int, packets: list[Packet], end: Fraction,
-    ) -> Iterator[tuple[VideoGop, Fraction]]:
-        gop = self._gop(index, packets)
-        if previous is not None:
-            yield previous, gop.start_time
-        yield gop, end
-
-    def close(self) -> None:
-        self.av_container.close()
+            if end is None:
+                end = self.start_time + self.duration + Fraction(1, 10_000) if self.duration is not None else max(
+                    (p.pts + (p.duration or 1)) * p.time_base for p in packets
+                )
+            gop = self._gop(packets)
+            if previous is not None:
+                yield previous, gop.start_time
+            yield gop, end

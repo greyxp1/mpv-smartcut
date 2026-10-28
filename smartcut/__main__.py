@@ -51,12 +51,8 @@ def main() -> None:
     keep = False
     try:
         selection = (Fraction(start), Fraction(end))
-        source = MediaContainer(input_path, selection)
-        try:
-            with open(output_path, "xb") as output:
-                smart_cut(source, selection, output, Progress(progress_path))
-        finally:
-            source.close()
+        with open(output_path, "xb") as output:
+            smart_cut(MediaContainer(input_path, selection), selection, output, Progress(progress_path).emit)
 
         try:
             os.link(output_path, final_path)
