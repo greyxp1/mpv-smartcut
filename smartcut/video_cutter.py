@@ -126,6 +126,7 @@ class VideoCutter:
 
         self.out_stream = out_stream
         self.codec_name = self.in_stream.codec_context.name
+        self.nal_length_size = media_container.nal_length_size
 
         self.remux_bitstream_filter = av.bitstream.BitStreamFilterContext('null', self.in_stream, self.out_stream)
         if self.in_stream.codec_context.name == 'h264' and not is_annexb(self.in_stream.codec_context.extradata):
@@ -655,7 +656,7 @@ class VideoCutter:
                 packet_dts = packet.dts if packet.dts is not None else packet.pts
                 should_collect = packet_dts is not None and packet_dts >= gop_start_dts
                 if should_collect and self.codec_name == 'hevc':
-                    nal_type = get_h265_nal_unit_type(bytes(packet))
+                    nal_type = get_h265_nal_unit_type(bytes(packet), self.nal_length_size)
                     if is_leading_picture_nal_type(nal_type):
                         should_collect = False
                 if should_collect:

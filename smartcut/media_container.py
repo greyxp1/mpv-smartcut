@@ -11,6 +11,7 @@ from av import time_base as AV_TIME_BASE
 from smartcut.nal_tools import (
     get_h264_nal_unit_type,
     get_h265_nal_unit_type,
+    get_nal_length_size,
     is_leading_picture_nal_type,
     is_rasl_nal_type,
     is_safe_h265_keyframe_nal,
@@ -39,6 +40,10 @@ class MediaContainer:
         self.start_time = Fraction(container.start_time, AV_TIME_BASE) if container.start_time is not None else Fraction(0)
         self.duration = Fraction(container.duration, AV_TIME_BASE) if container.duration is not None else None
         self.video_stream: VideoStream | None = container.streams.video[0] if container.streams.video else None
+        self.nal_length_size = get_nal_length_size(
+            self.video_stream.codec_context.name,
+            self.video_stream.codec_context.extradata,
+        ) if self.video_stream is not None else 0
         self.passthrough_streams = [
             stream for stream in container.streams
             if stream.type in ('audio', 'subtitle') and stream.time_base
@@ -88,7 +93,7 @@ class MediaContainer:
         assert self.video_stream is not None
         codec = self.video_stream.codec_context.name
         if codec == 'hevc':
-            return is_safe_h265_keyframe_nal(get_h265_nal_unit_type(bytes(packet)))
+            return is_safe_h265_keyframe_nal(get_h265_nal_unit_type(bytes(packet), self.nal_length_size))
         return True
 
     def _gop(self, index: int, packets: list[Packet]) -> VideoGop:
@@ -100,15 +105,15 @@ class MediaContainer:
         assert self.video_stream is not None
         codec = self.video_stream.codec_context.name
         if codec == 'h264':
-            is_idr = get_h264_nal_unit_type(bytes(first)) == 5
+            is_idr = get_h264_nal_unit_type(bytes(first), self.nal_length_size) == 5
             needs_priming = not is_idr
         elif codec == 'hevc':
-            nal_type = get_h265_nal_unit_type(bytes(first))
+            nal_type = get_h265_nal_unit_type(bytes(first), self.nal_length_size)
             is_idr = nal_type in (19, 20)
             if nal_type == 21:
                 has_leading = False
                 for packet in packets[1:]:
-                    nal_type = get_h265_nal_unit_type(bytes(packet))
+                    nal_type = get_h265_nal_unit_type(bytes(packet), self.nal_length_size)
                     if not is_leading_picture_nal_type(nal_type):
                         if has_leading:
                             leading_end_dts = packet.dts
