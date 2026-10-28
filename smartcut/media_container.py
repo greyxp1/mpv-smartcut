@@ -7,6 +7,7 @@ from os import cpu_count
 from av import Packet, VideoStream
 from av import open as av_open
 from av import time_base as AV_TIME_BASE
+from av.stream import Disposition
 
 from smartcut.nal_tools import (
     get_h264_nal_unit_type,
@@ -39,7 +40,10 @@ class MediaContainer:
         self.av_container = container = av_open(path, 'r')
         self.start_time = Fraction(container.start_time, AV_TIME_BASE) if container.start_time is not None else Fraction(0)
         self.duration = Fraction(container.duration, AV_TIME_BASE) if container.duration is not None else None
-        self.video_stream: VideoStream | None = container.streams.video[0] if container.streams.video else None
+        self.video_stream: VideoStream | None = next((
+            stream for stream in container.streams.video
+            if Disposition.attached_pic not in stream.disposition
+        ), None)
         self.nal_length_size = get_nal_length_size(
             self.video_stream.codec_context.name,
             self.video_stream.codec_context.extradata,
