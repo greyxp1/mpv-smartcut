@@ -7,6 +7,7 @@ from typing import cast
 import av
 import av.bitstream
 from av import VideoCodecContext, VideoStream
+from av.codec.codec import UnknownCodecError
 from av.codec.context import CodecContext
 from av.container.output import OutputContainer
 from av.packet import Packet
@@ -276,13 +277,25 @@ class VideoCutter:
         if self.enc_codec is not None:
             return
 
-        muxing_codec = self.out_stream.codec_context
-        nvenc_pix_fmt = NVENC_PIX_FMTS.get(muxing_codec.pix_fmt) if self.nvenc_options is not None else None
+        pix_fmt = self.out_stream.codec_context.pix_fmt
+        nvenc_pix_fmt = NVENC_PIX_FMTS.get(pix_fmt) if self.nvenc_options is not None else None
+        enc_codec = None
         if nvenc_pix_fmt is not None:
             assert self.nvenc_options is not None
-            name, options, pix_fmt = f'{self.codec_name}_nvenc', self.nvenc_options, nvenc_pix_fmt
-        else:
-            name, options, pix_fmt = self.codec_name, self.encoding_options, muxing_codec.pix_fmt
+            try:
+                enc_codec = self._create_encoder(f'{self.codec_name}_nvenc', self.nvenc_options, nvenc_pix_fmt)
+                enc_codec.open()
+            except (av.FFmpegError, UnknownCodecError):
+                # No NVENC in FFmpeg or no usable NVIDIA GPU or driver; use the software encoder.
+                enc_codec = None
+                self.nvenc_options = None
+        if enc_codec is None:
+            enc_codec = self._create_encoder(self.codec_name, self.encoding_options, pix_fmt)
+        self.enc_last_pts = -1
+        self.enc_codec = enc_codec
+
+    def _create_encoder(self, name: str, options: dict[str, str], pix_fmt: str) -> VideoCodecContext:
+        muxing_codec = self.out_stream.codec_context
         enc_codec = cast(VideoCodecContext, CodecContext.create(name, 'w'))
 
         rate = muxing_codec.rate or self.in_stream.guessed_rate
@@ -320,15 +333,7 @@ class VideoCutter:
         enc_codec.codec_tag = muxing_codec.codec_tag
         enc_codec.thread_count = CODEC_THREADS
         enc_codec.thread_type = "FRAME"
-        if nvenc_pix_fmt is not None:
-            try:
-                enc_codec.open()
-            except av.FFmpegError:
-                # No usable NVIDIA GPU or driver; use the software encoder.
-                self.nvenc_options = None
-                return self._ensure_enc_codec()
-        self.enc_last_pts = -1
-        self.enc_codec = enc_codec
+        return enc_codec
 
     def segment(self, cut_segment: CutSegment) -> list[Packet]:
         assert self.current_gop is not None
