@@ -118,13 +118,14 @@ class VideoCutter:
         self.codec_name = self.in_stream.codec_context.name
         self.nal_length_size = media_container.nal_length_size
 
-        self.remux_bitstream_filter = av.bitstream.BitStreamFilterContext('null', self.in_stream, self.out_stream)
-        if self.in_stream.codec_context.name == 'h264' and not is_annexb(self.in_stream.codec_context.extradata):
-            self.remux_bitstream_filter = av.bitstream.BitStreamFilterContext('h264_mp4toannexb', self.in_stream, self.out_stream)
-        elif self.in_stream.codec_context.name == 'hevc' and not is_annexb(self.in_stream.codec_context.extradata):
-            self.remux_bitstream_filter = av.bitstream.BitStreamFilterContext('hevc_mp4toannexb', self.in_stream, self.out_stream)
-        elif self.in_stream.codec_context.name in {'mpeg4', 'msmpeg4v3', 'msmpeg4v2', 'msmpeg4v1'}:
-            self.remux_bitstream_filter = av.bitstream.BitStreamFilterContext('dump_extra', self.in_stream, self.out_stream)
+        bitstream_filter = 'null'
+        if self.codec_name in ('h264', 'hevc') and not is_annexb(self.in_stream.codec_context.extradata):
+            bitstream_filter = f'{self.codec_name}_mp4toannexb'
+        elif self.codec_name in {'hevc', 'mpeg4', 'msmpeg4v3', 'msmpeg4v2', 'msmpeg4v1'}:
+            # Copied keyframes repeat the source headers. Encoded HEVC boundaries
+            # replace parameter sets under the same IDs.
+            bitstream_filter = 'dump_extra'
+        self.remux_bitstream_filter = av.bitstream.BitStreamFilterContext(bitstream_filter, self.in_stream, self.out_stream)
 
         # Normalize codec tags for container compatibility (must be done after bitstream filter setup)
         _normalize_output_codec_tag(self.out_stream, output_av_container, self.in_stream)
