@@ -108,6 +108,8 @@ class MediaContainer:
         step = ceil(1 / video.time_base)
         target = timestamp
         while True:
+            # AVI and FLV reject negative timestamps.
+            target = max(target, min(video.start_time or 0, 0))
             self.av_container.seek(target, stream=video)
             keyframe = next((
                 min(packet.pts, packet.dts) if packet.dts is not None else packet.pts
