@@ -144,7 +144,11 @@ class VideoCutter:
         for frame in self._decode(packets, end):
             time = frame.pts * frame.time_base
             if time >= start:
-                result += self._encode_at(frame, round((time - self.origin) / time_base))
+                time -= self.origin
+                if self.enc_offset is None:
+                    # MPEG-2 encodes on a frame-rate clock. Keep it in phase with the copied frames.
+                    self.enc_offset = time - round(time / time_base) * time_base if self.codec_name == 'mpeg2video' else 0
+                result += self._encode_at(frame, round((time - self.enc_offset) / time_base))
                 self.has_output_frames = True
         return result
 
@@ -196,9 +200,9 @@ class VideoCutter:
         if self.codec_name == 'mpeg2video':
             # The MPEG-2 encoder uses a frame-rate time base.
             for p in packets:
-                p.pts = round(p.pts * p.time_base / self.time_base)
+                p.pts = round((p.pts * p.time_base + (self.enc_offset or 0)) / self.time_base)
                 if p.dts is not None:
-                    p.dts = round(p.dts * p.time_base / self.time_base)
+                    p.dts = round((p.dts * p.time_base + (self.enc_offset or 0)) / self.time_base)
                 p.time_base = self.time_base
         return packets
 
@@ -230,6 +234,7 @@ class VideoCutter:
     def _ensure_encoder(self) -> VideoCodecContext:
         if self.enc_codec is None:
             self.enc_last_pts = -1
+            self.enc_offset = None
             pix_fmt = self.out_stream.codec_context.pix_fmt
             nvenc_pix_fmt = NVENC_PIX_FMTS.get(pix_fmt)
             if self.nvenc_options is not None and nvenc_pix_fmt is not None:
