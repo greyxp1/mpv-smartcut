@@ -59,7 +59,7 @@ def smart_cut(
                 if overlap_start >= overlap_end:
                     continue
                 found_media = True
-                output.mux(video_cutter.segment(overlap_start, overlap_end, gop.start_time < start or gop_end > end))
+                output.mux(video_cutter.segment(overlap_start, overlap_end, gop_end > end))
                 timestamp = overlap_end
             completed = int((timestamp - selection[0] - media_container.start_time) * 1_000_000)
             progress(max(0, min(total, completed)), total)

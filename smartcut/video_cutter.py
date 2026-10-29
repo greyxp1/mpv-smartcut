@@ -103,11 +103,18 @@ class VideoCutter:
     def prepare_gop(self, gop: VideoGop) -> None:
         self.previous_gop, self.current_gop = self.current_gop, gop
 
-    def segment(self, start: Fraction, end: Fraction, require_recode: bool) -> list[Packet]:
+    def segment(self, start: Fraction, end: Fraction, cuts_end: bool) -> list[Packet]:
         gop, previous = self.current_gop, self.previous_gop
         follows_remux = previous is not None and self.last_remuxed_gop is previous
+        keyframe_time = gop.packets[0].pts * self.time_base
+        # HEVC leading pictures display before their CRA and can be recoded on their own,
+        # when the cut drops some of them or RASL pictures lost their references.
+        recode_leading = self.codec_name == 'hevc' and gop.leading_count > 0 and start <= keyframe_time and (
+            gop.start_time < start or (gop.needs_priming and previous is not None and not follows_remux)
+        )
         if (
-            require_recode
+            cuts_end
+            or (gop.start_time < start and not recode_leading)
             # A non-IDR H.264 GOP can only follow its original predecessor. After
             # recoding, keep recoding until an IDR GOP resets the sequence.
             or (self.codec_name == 'h264' and gop.needs_priming and not follows_remux)
@@ -116,8 +123,8 @@ class VideoCutter:
                 and previous is not None and not self.has_output_frames)
         ):
             return self._fix_timestamps(self._recode(start, end))
-        if self.codec_name == 'hevc' and gop.needs_priming and previous is not None and not follows_remux:
-            packets = self._recode_leading(end)
+        if recode_leading:
+            packets = self._recode_leading(start, end, keyframe_time)
         else:
             packets = self.flush_encoder() + self._remux(gop.packets)
         self.last_remuxed_gop = gop
@@ -141,19 +148,20 @@ class VideoCutter:
                 self.has_output_frames = True
         return result
 
-    def _recode_leading(self, end: Fraction) -> list[Packet]:
-        """Recode the RASL/RADL pictures of a CRA GOP and copy the CRA and trailing pictures.
+    def _recode_leading(self, start: Fraction, end: Fraction, keyframe_time: Fraction) -> list[Packet]:
+        """Recode the selected RASL/RADL pictures of a CRA GOP and copy the CRA and trailing pictures.
 
         HEVC places leading pictures right after their CRA in decoding order.
         """
-        gop = self.current_gop
+        gop, previous = self.current_gop, self.previous_gop
         count = gop.leading_count + 1
-        cra_time = gop.packets[0].pts * self.time_base
-        self._ensure_encoder()
         result = []
-        for frame in self._decode([*self.previous_gop.packets, *gop.packets[:count]], end):
-            if gop.start_time <= frame.pts * frame.time_base < cra_time:
-                result += self._encode_at(frame, int(frame.pts - self.shift))
+        if start < keyframe_time:
+            self._ensure_encoder()
+            priming = previous.packets if previous is not None and gop.needs_priming else []
+            for frame in self._decode([*priming, *gop.packets[:count]], end):
+                if start <= frame.pts * frame.time_base < keyframe_time:
+                    result += self._encode_at(frame, int(frame.pts - self.shift))
         return result + self.flush_encoder() + self._remux([gop.packets[0], *gop.packets[count:]])
 
     def _remux(self, packets: list[Packet]) -> list[Packet]:
