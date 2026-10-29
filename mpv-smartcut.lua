@@ -62,9 +62,12 @@ local function finish_job(output, kept, success, result, error_message)
     elseif success and result.status == 0 then
         notify("Cut complete: " .. output, 5)
     else
-        local detail = result and (result.stderr ~= "" and result.stderr or result.error_string)
-            or error_message or "unknown error"
-        detail = detail:gsub("%s+$", ""):sub(-500)
+        local detail = (result and result.stderr or ""):gsub("%s+$", ""):sub(-500)
+        if detail == "" then
+            local reason = result and result.error_string or ""
+            detail = reason == "init" and "could not run " .. opts.backend or reason ~= "" and reason
+                or error_message or result and "exit status " .. tostring(result.status) or "unknown error"
+        end
         local failed = not (result and result.status == 2)
         mp.msg.error((failed and "Cut failed: " or "") .. detail)
         mp.osd_message(failed and "Cut failed: " .. detail or "Cut completed but could not be published: " .. kept, 8)
